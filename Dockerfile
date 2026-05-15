@@ -1,74 +1,57 @@
 # ─────────────────────────────────────────────────────────────────────
-# Stage 1: Build — install native Node deps (better-sqlite3 needs gcc)
+# Stage 1: Build — compile native addons (better-sqlite3 needs gcc/g++)
 # ─────────────────────────────────────────────────────────────────────
-FROM eclipse-temurin:21-jre-jammy AS base
+FROM eclipse-temurin:21-jre-jammy AS builder
 
-# System deps: Node.js 20 LTS + build tools for better-sqlite3
+# Install Node.js 20 LTS + build tools
 RUN apt-get update -qq && \
     apt-get install -y --no-install-recommends \
-        curl \
-        ca-certificates \
-        gnupg \
-        unzip \
-        tar \
-        python3 \
-        make \
-        g++ \
+        curl ca-certificates gnupg \
+        python3 make g++ \
+        unzip tar \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
-    && apt-get clean \
-    && rm -rf /var/lib/apt/lists/*
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# Verify java is available (comes from eclipse-temurin base)
-RUN java -version
-
-# ─────────────────────────────────────────────────────────────────────
-# Stage 2: Install Node deps
-# ─────────────────────────────────────────────────────────────────────
 WORKDIR /app
 
-# Copy only package files first for layer caching
-COPY package.json package-lock.json* ./
+# Copy package.json (no lock file required — npm install generates one)
+COPY package.json ./
 
-RUN npm ci --omit=dev --ignore-scripts=false
+# npm install works with or without package-lock.json
+RUN npm install --omit=dev --no-audit --no-fund
 
 # ─────────────────────────────────────────────────────────────────────
-# Stage 3: Runtime image
+# Stage 2: Runtime — slim image with Java + Node, no build tools
 # ─────────────────────────────────────────────────────────────────────
 FROM eclipse-temurin:21-jre-jammy
 
-# Runtime tools only (no build tools)
+# Install Node.js 20 LTS (runtime only, no gcc/g++)
 RUN apt-get update -qq && \
     apt-get install -y --no-install-recommends \
-        curl \
-        ca-certificates \
-        unzip \
-        tar \
-        nodejs \
-    && apt-get clean \
-    && rm -rf /var/lib/apt/lists/*
-
-# Re-install Node.js 20 LTS properly in the final stage
-RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+        curl ca-certificates \
+        unzip tar \
+    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
-    && apt-get clean \
-    && rm -rf /var/lib/apt/lists/*
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Verify Java is present
+RUN java -version
 
 WORKDIR /app
 
-# Copy node_modules from build stage
-COPY --from=base /app/node_modules ./node_modules
+# Copy compiled node_modules from builder stage
+COPY --from=builder /app/node_modules ./node_modules
 
-# Copy application source
+# Copy application
 COPY bot.js ./
 
-# Data directories (servers + SQLite db)
+# Persistent data directories
 RUN mkdir -p /data/servers /data/db
 
 # ─────────────────────────────────────────────────────────────────────
-# Environment — all values are injected by the hosting platform.
-# DO NOT create a .env file. Set these as environment variables
-# in your hosting panel (Railway, Render, VPS, Docker Compose, etc.)
+# Environment defaults — override via your hosting panel.
+# DO NOT create a .env file; all vars come from the host environment.
 # ─────────────────────────────────────────────────────────────────────
 ENV NODE_ENV=production \
     SERVERS_ROOT=/data/servers \
@@ -78,15 +61,16 @@ ENV NODE_ENV=production \
     JVM_XMX=1G \
     MAX_UPLOAD_MB=50
 
-# Required at runtime (must be provided by host):
-#   BOT_TOKEN, ADMIN_ID, ONLYSQ_API_KEY
+# Required env vars (set in hosting panel, NOT in a file):
+#   BOT_TOKEN        — Telegram bot token
+#   ADMIN_ID         — Telegram user ID of the admin
+#   ONLYSQ_API_KEY   — OnlySQ / OpenAI-compatible API key
 # Optional:
 #   ONLYSQ_BASE_URL, ONLYSQ_DEFAULT_MODEL, JVM_XMS, JVM_XMX, MAX_UPLOAD_MB
 
 VOLUME ["/data/servers", "/data/db"]
 
-# Healthcheck — make sure the process is alive
-HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \
     CMD node -e "process.exit(0)" || exit 1
 
 CMD ["node", "bot.js"]
