@@ -1,0 +1,27 @@
+# ─────────────────────────────────────────────────────────────────────
+# railway.toml — Railway service config for mc-tg-bot
+# ─────────────────────────────────────────────────────────────────────
+#
+# Docs: https://docs.railway.com/reference/config-as-code
+#
+# IMPORTANT — после первого деплоя сделайте в UI Railway:
+#   1) Service → Settings → Networking → Enable TCP Proxy
+#      Internal port = <тот же, что в RAILWAY_TCP_APPLICATION_PORT, обычно PORT>
+#   2) Service → Volumes → Attach (mount path = /data)
+#   3) Service → Variables → BOT_TOKEN, ADMIN_ID, ONLYSQ_API_KEY
+# ─────────────────────────────────────────────────────────────────────
+
+[build]
+builder        = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+startCommand            = "node bot.js"
+restartPolicyType       = "ON_FAILURE"
+restartPolicyMaxRetries = 10
+healthcheckTimeout      = 60
+numReplicas             = 1
+
+# Railway шлёт SIGTERM при редеплое — дайте боту время корректно остановить MC-серверы.
+[deploy.environment]
+RAILWAY_DEPLOYMENT_DRAINING_SECONDS = "20"

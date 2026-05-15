@@ -1,12 +1,13 @@
 {
-  "name": "mc-tg-bot",
-  "version": "1.0.0",
-  "description": "Telegram bot to manage Minecraft servers (Bukkit/Spigot/Paper) with OnlySQ AI integration",
+  "name": "mc-tg-bot-railway",
+  "version": "2.0.0",
+  "description": "Production-ready Telegram bot for managing Minecraft servers (Bukkit/Spigot/Paper/Forge) — Railway-optimized edition with OnlySQ AI integration",
   "main": "bot.js",
   "type": "commonjs",
   "scripts": {
     "start": "node bot.js",
-    "dev": "node --watch bot.js"
+    "dev": "node --watch bot.js",
+    "check": "node --check bot.js && node --check mcproxy.js"
   },
   "engines": {
     "node": ">=18.17"

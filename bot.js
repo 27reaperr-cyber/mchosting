@@ -48,18 +48,55 @@ const { request } = require('undici');
 // 0. CONFIG & VALIDATION
 // =====================================================================
 
+// ─────────────────────────────────────────────────────────────────────
+// 🚂 RAILWAY DETECTION
+// ─────────────────────────────────────────────────────────────────────
+// Railway автоматически предоставляет следующие переменные окружения:
+//   RAILWAY_TCP_PROXY_DOMAIN  — публичный домен TCP-прокси (e.g. "shuttle.proxy.rlwy.net")
+//   RAILWAY_TCP_PROXY_PORT    — публичный TCP-порт прокси (e.g. 15140)
+//   RAILWAY_TCP_APPLICATION_PORT — внутренний порт, на который Railway шлёт TCP-трафик
+//                                  (= PORT, который ставит Railway. По дефолту 25565).
+//   RAILWAY_VOLUME_MOUNT_PATH — путь к подключённому persistent volume (e.g. "/data")
+//   RAILWAY_PUBLIC_DOMAIN     — публичный HTTP-домен (для healthcheck)
+//
+// Архитектура на Railway:
+//   - Railway даёт ОДИН публичный TCP-порт (RAILWAY_TCP_PROXY_PORT). Этого хватит —
+//     наш встроенный handshake-router маршрутизирует по поддоменам.
+//   - Бот слушает на PORT = RAILWAY_TCP_APPLICATION_PORT внутри контейнера.
+//   - Все MC-серверы слушают на 127.0.0.1:<внутренний-порт> (не торчат наружу).
+//   - Volume монтируется в RAILWAY_VOLUME_MOUNT_PATH; туда кладём servers/ и db/.
+const ON_RAILWAY = !!(process.env.RAILWAY_ENVIRONMENT_NAME || process.env.RAILWAY_PROJECT_ID);
+const RW_TCP_DOMAIN = process.env.RAILWAY_TCP_PROXY_DOMAIN || '';
+const RW_TCP_PORT   = Number(process.env.RAILWAY_TCP_PROXY_PORT || 0);
+// Внутренний порт, на котором Railway ожидает наше TCP-приложение.
+// PORT — стандартная переменная Railway. RAILWAY_TCP_APPLICATION_PORT — более явная.
+const RW_INTERNAL_TCP_PORT = Number(
+    process.env.RAILWAY_TCP_APPLICATION_PORT ||
+    process.env.PORT ||
+    0
+);
+const RW_VOLUME = process.env.RAILWAY_VOLUME_MOUNT_PATH || '';
+
+if (ON_RAILWAY) {
+    console.log('[INFO ] 🚂 Railway environment detected:');
+    console.log(`        TCP_PROXY_DOMAIN = ${RW_TCP_DOMAIN || '(not set — enable TCP proxy in service settings)'}`);
+    console.log(`        TCP_PROXY_PORT   = ${RW_TCP_PORT || '(not set)'}`);
+    console.log(`        INTERNAL_PORT    = ${RW_INTERNAL_TCP_PORT || '(not set)'}`);
+    console.log(`        VOLUME_MOUNT     = ${RW_VOLUME || '(no volume attached)'}`);
+}
+
 const ENV = {
     BOT_TOKEN: process.env.BOT_TOKEN,
     ADMIN_ID: Number(process.env.ADMIN_ID),
     ONLYSQ_API_KEY: process.env.ONLYSQ_API_KEY,
     ONLYSQ_BASE_URL: process.env.ONLYSQ_BASE_URL || 'https://api.onlysq.ru/v1',
     ONLYSQ_DEFAULT_MODEL: process.env.ONLYSQ_DEFAULT_MODEL || 'claude-haiku-4-5',
-    SERVERS_ROOT: path.resolve(process.env.SERVERS_ROOT || './servers'),
+    SERVERS_ROOT: path.resolve(process.env.SERVERS_ROOT || (RW_VOLUME ? path.join(RW_VOLUME, 'servers') : './servers')),
     JAVA_BIN: process.env.JAVA_BIN || 'java',
     JVM_XMS: process.env.JVM_XMS || '1G',
     JVM_XMX: process.env.JVM_XMX || '2G',
     MAX_UPLOAD_MB: Number(process.env.MAX_UPLOAD_MB || 50),
-    DB_PATH: path.resolve(process.env.DB_PATH || './data/bot.db'),
+    DB_PATH: path.resolve(process.env.DB_PATH || (RW_VOLUME ? path.join(RW_VOLUME, 'bot.db') : './data/bot.db')),
     PAPER_UA: process.env.PAPER_UA || 'mc-tg-bot/1.0.0 (+https://github.com/local)',
     // Auto-port allocation range. Each new server gets a random free port
     // from this range so multiple users never collide.
@@ -88,9 +125,14 @@ const ENV = {
     //   *.mchost.bothost.tech  A  <IP хоста>
     //   mchost.bothost.tech    A  <IP хоста>
     PROXY_ENABLED: (process.env.PROXY_ENABLED || '1') !== '0',
-    PROXY_DOMAIN:  process.env.PROXY_DOMAIN  || 'mchost.bothost.tech',
-    PROXY_PORT:    Number(process.env.PROXY_PORT  || 25600),
+    PROXY_DOMAIN:  process.env.PROXY_DOMAIN  || RW_TCP_DOMAIN || 'mchost.bothost.tech',
+    PROXY_PORT:    Number(process.env.PROXY_PORT  || RW_TCP_PORT || 25600),
     PROXY_HOST:    process.env.PROXY_HOST    || '0.0.0.0',
+    // На Railway TCP-proxy шлёт трафик на RAILWAY_TCP_APPLICATION_PORT (= PORT),
+    // а игроки видят PROXY_PORT. Поэтому наш listener слушает PROXY_LISTEN_PORT,
+    // а внешний адрес — PROXY_PORT. В обычной среде они совпадают.
+    PROXY_LISTEN_PORT: Number(process.env.PROXY_LISTEN_PORT || RW_INTERNAL_TCP_PORT || process.env.PROXY_PORT || 25600),
+    ON_RAILWAY,
     // BIND_HOST для самих MC-серверов: когда прокси включён, серверы должны
     // слушать ТОЛЬКО на 127.0.0.1 (наружу не торчат, всё идёт через прокси).
     // Если пользователь хочет старое поведение — пусть выставит BIND_HOST=''.
@@ -865,6 +907,13 @@ function briefHttpError(msg, max = 220) {
 const db = new Database(ENV.DB_PATH);
 db.pragma('journal_mode = WAL');
 db.pragma('foreign_keys = ON');
+// Performance tuning: NORMAL is durable enough for our workload (settings + small CRUD),
+// mmap_size accelerates reads, busy_timeout prevents SQLITE_BUSY under concurrent access.
+db.pragma('synchronous = NORMAL');
+db.pragma('temp_store = MEMORY');
+db.pragma('cache_size = -20000');       // 20 MB page cache
+db.pragma('mmap_size = 67108864');      // 64 MB mmap
+db.pragma('busy_timeout = 5000');
 
 db.exec(`
     CREATE TABLE IF NOT EXISTS users (
@@ -1010,6 +1059,35 @@ function listUsers() {
     const pending = db.prepare(`SELECT username, granted_by, created_at FROM pending_usernames ORDER BY created_at`).all();
     return { users, pending };
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// PROXY DOMAIN / PORT (overridable from Admin Panel — persisted in DB)
+// ─────────────────────────────────────────────────────────────────────
+// Приоритет: settings table > ENV > default. Это позволяет админу менять
+// домен прямо из Telegram без перезапуска контейнера.
+function getProxyDomain() {
+    return getSetting('proxy_domain') || ENV.PROXY_DOMAIN;
+}
+function getProxyPort() {
+    const v = getSetting('proxy_port');
+    return v ? Number(v) : ENV.PROXY_PORT;
+}
+function setProxyDomain(d) { setSetting('proxy_domain', String(d || '').trim()); }
+function setProxyPort(p)   { setSetting('proxy_port',   String(Number(p) || 0)); }
+
+/** Validation: RFC-1035-ish hostname check, supports multi-label domains. */
+function isValidDomain(d) {
+    if (typeof d !== 'string') return false;
+    const s = d.trim().toLowerCase();
+    if (s.length < 3 || s.length > 253) return false;
+    // No protocol, no path, no port.
+    if (/[:\/\\\s]/.test(s)) return false;
+    // Each label: 1–63 chars, [a-z0-9-], no leading/trailing dash.
+    const labels = s.split('.');
+    if (labels.length < 2) return false;
+    return labels.every(l => /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(l));
+}
+
 
 // =====================================================================
 // 3. OnlySQ CLIENT (OpenAI-compatible)
@@ -1488,8 +1566,10 @@ function allocateSubdomain(seed, ownerId) {
 function publicAddressForServer(server) {
     if (!ENV.PROXY_ENABLED) return null;
     if (!server || !server.subdomain) return null;
-    const portPart = (ENV.PROXY_PORT === 25565) ? '' : (':' + ENV.PROXY_PORT);
-    return `${server.subdomain}.${ENV.PROXY_DOMAIN}${portPart}`;
+    const port = getProxyPort();
+    const dom  = getProxyDomain();
+    const portPart = (port === 25565) ? '' : (':' + port);
+    return `${server.subdomain}.${dom}${portPart}`;
 }
 
 /**
@@ -3265,6 +3345,56 @@ bot.on('text', async (ctx, next) => {
         return handlePortWaitInput(ctx);
     }
 
+    // ----- Admin: waiting for new proxy domain -----
+    if (ctx.session.domainWait && isAdmin(ctx.from.id)) {
+        const text = (ctx.message.text || '').trim();
+        ctx.session.domainWait = null;
+        if (/^\/cancel$/i.test(text)) {
+            return ctx.reply('Отменено.', adminPanelBackKb());
+        }
+        if (/^reset$/i.test(text)) {
+            db.prepare(`DELETE FROM settings WHERE key IN ('proxy_domain','proxy_port')`).run();
+            return ctx.reply(
+                `<tg-emoji emoji-id="5870633910337015697">✅</tg-emoji> Сброшено. Домен: <code>${esc(getProxyDomain())}</code>:<code>${getProxyPort()}</code>`,
+                { parse_mode: 'HTML', ...adminPanelBackKb() }
+            );
+        }
+        if (/^railway$/i.test(text)) {
+            if (!ENV.ON_RAILWAY || !RW_TCP_DOMAIN || !RW_TCP_PORT) {
+                return ctx.reply('⚠️ Railway TCP-proxy не настроен. Включите его в Service → Settings → Networking.', adminPanelBackKb());
+            }
+            setProxyDomain(RW_TCP_DOMAIN);
+            setProxyPort(RW_TCP_PORT);
+            return ctx.reply(
+                `<tg-emoji emoji-id="5870633910337015697">✅</tg-emoji> Применён Railway TCP-proxy: <code>${esc(RW_TCP_DOMAIN)}:${RW_TCP_PORT}</code>`,
+                { parse_mode: 'HTML', ...adminPanelBackKb() }
+            );
+        }
+        // Parse "domain" or "domain:port"
+        let dom = text;
+        let port = null;
+        const m = text.match(/^([^\s:]+):(\d+)$/);
+        if (m) { dom = m[1]; port = Number(m[2]); }
+        if (!isValidDomain(dom)) {
+            return ctx.reply(
+                '❌ Неверный домен. Пример: <code>mc.example.com</code> или <code>shuttle.proxy.rlwy.net:15140</code>.\n/cancel — отмена.',
+                { parse_mode: 'HTML' }
+            );
+        }
+        if (port !== null && (!Number.isInteger(port) || port < 1 || port > 65535)) {
+            return ctx.reply('❌ Неверный порт. Допустимый диапазон: 1–65535.');
+        }
+        setProxyDomain(dom);
+        if (port !== null) setProxyPort(port);
+        return ctx.reply(
+            `<tg-emoji emoji-id="5870633910337015697">✅</tg-emoji> Домен реверс-прокси обновлён:\n` +
+            `<code>${esc(getProxyDomain())}:${getProxyPort()}</code>\n\n` +
+            `Все новые подключения игроков пойдут на этот адрес. ` +
+            `Не забудьте обновить DNS-запись: <code>*.${esc(getProxyDomain())}</code> → этот хост.`,
+            { parse_mode: 'HTML', ...adminPanelBackKb() }
+        );
+    }
+
     // ----- Subdomain rename: ctx.session.subRename = { serverId } -----
     if (ctx.session.subRename) {
         const sr = ctx.session.subRename;
@@ -4466,9 +4596,16 @@ function adminPanelKeyboard() {
         [btn('🌐 Публичный IP', 'adm:ip')],
     ];
     if (ENV.PROXY_ENABLED) {
-        rows.push([btn('🔀 MC Reverse-proxy', 'adm:proxy')]);
+        rows.push(
+            [btn(`🌐 Сменить домен (${getProxyDomain()})`, 'adm:domain')],
+            [btn('🔀 MC Reverse-proxy', 'adm:proxy')],
+        );
+    }
+    if (ENV.ON_RAILWAY) {
+        rows.push([btn('🚂 Railway: статус и порты', 'adm:railway')]);
     }
     rows.push(
+        [btn('🔌 Авто-открыть порты', 'adm:autoopen')],
         [btn('📊 Нагрузка VPS', 'adm:vps')],
         [btn('🖥 Консоль VPS', 'adm:shell')],
         [btn('🔒 Порты / Файрвол', 'adm:ports')],
@@ -5228,10 +5365,19 @@ async function startMcProxy() {
         return;
     }
     const { MinecraftReverseProxy } = require('./mcproxy');
+    // На Railway listener слушает на RAILWAY_TCP_APPLICATION_PORT (= PORT),
+    // а игроки подключаются к RAILWAY_TCP_PROXY_PORT снаружи (через Railway TCP-proxy).
+    // В self-host обе переменные равны PROXY_PORT.
+    const listenPort = ENV.PROXY_LISTEN_PORT || ENV.PROXY_PORT;
     MC_PROXY = new MinecraftReverseProxy({
         listenHost: ENV.PROXY_HOST,
-        listenPort: ENV.PROXY_PORT,
-        baseDomain: ENV.PROXY_DOMAIN,
+        listenPort,
+        baseDomain: getProxyDomain(),
+        // Динамический резолвер домена — позволяет менять домен из админки без рестарта.
+        getBaseDomain: () => getProxyDomain(),
+        // Performance tuning
+        idleTimeoutMs: 0,         // MC sends keepalive → no idle close
+        handshakeTimeoutMs: 7000, // чуть мягче чем дефолт
         log: {
             info:  (m) => log.info('[mcproxy]',  m),
             warn:  (m) => log.warn('[mcproxy]',  m),
@@ -5250,11 +5396,15 @@ async function startMcProxy() {
     });
     try {
         await MC_PROXY.start();
-        log.info(`   🔀 MC reverse-proxy started on ${ENV.PROXY_HOST}:${ENV.PROXY_PORT}`);
-        log.info(`      Players connect via: <subdomain>.${ENV.PROXY_DOMAIN}:${ENV.PROXY_PORT}`);
-        log.info(`      Make sure DNS *.${ENV.PROXY_DOMAIN} → this host's public IP.`);
+        log.info(`   🔀 MC reverse-proxy listening on ${ENV.PROXY_HOST}:${listenPort}`);
+        log.info(`      Public address: <subdomain>.${getProxyDomain()}:${getProxyPort()}`);
+        if (ENV.ON_RAILWAY) {
+            log.info(`      (Railway TCP-proxy: ${RW_TCP_DOMAIN}:${RW_TCP_PORT} → container:${listenPort})`);
+        } else {
+            log.info(`      Make sure DNS *.${getProxyDomain()} → this host's public IP.`);
+        }
     } catch (e) {
-        log.error(`   ❌ Не удалось поднять реверс-прокси на :${ENV.PROXY_PORT}: ${e.message}`);
+        log.error(`   ❌ Не удалось поднять реверс-прокси на :${listenPort}: ${e.message}`);
         log.error(`      → возможно, порт занят или нет прав; бот продолжит без прокси.`);
         MC_PROXY = null;
     }
@@ -5343,6 +5493,167 @@ bot.action('adm:proxy', async (ctx) => {
     );
 });
 
+
+// ---------------------------------------------------------------
+// Admin: смена домена реверс-прокси (записывается в settings и сразу
+// применяется к новым публичным адресам; рестарт listener'а НЕ требуется,
+// потому что mcproxy теперь читает baseDomain через getBaseDomain()).
+// ---------------------------------------------------------------
+bot.action('adm:domain', async (ctx) => {
+    await ctx.answerCbQuery().catch(() => {});
+    if (!isAdmin(ctx.from.id)) return;
+    const cur = getProxyDomain();
+    const curPort = getProxyPort();
+    const railwayHint = ENV.ON_RAILWAY && RW_TCP_DOMAIN
+        ? `\n\n🚂 <b>Railway TCP-proxy:</b> <code>${esc(RW_TCP_DOMAIN)}:${RW_TCP_PORT}</code>\n` +
+          `Можно использовать его напрямую, либо указать свой CNAME-домен.`
+        : '';
+    ctx.session.domainWait = { action: 'set' };
+    return safeEdit(ctx,
+        `🌐 <b>Домен реверс-прокси</b>\n\n` +
+        `Текущий: <code>${esc(cur)}</code>:<code>${curPort}</code>\n\n` +
+        `Введите новый домен (например <code>mc.example.com</code>).\n` +
+        `• Можно с портом: <code>mc.example.com:25600</code>\n` +
+        `• Или просто домен (порт оставим текущим).\n` +
+        `• Команда <code>reset</code> — вернуть значение из ENV.\n` +
+        `• Команда <code>railway</code> — использовать Railway TCP-proxy (если включён).` +
+        railwayHint,
+        Markup.inlineKeyboard([
+            [btn('🚂 Авто (Railway TCP-proxy)', 'adm:domain:auto')],
+            [btn('↩️ Сбросить в ENV', 'adm:domain:reset')],
+            [btn('⬅️ Назад', 'adm:open')],
+        ])
+    );
+});
+
+bot.action('adm:domain:auto', async (ctx) => {
+    await ctx.answerCbQuery().catch(() => {});
+    if (!isAdmin(ctx.from.id)) return;
+    ctx.session.domainWait = null;
+    if (!ENV.ON_RAILWAY || !RW_TCP_DOMAIN || !RW_TCP_PORT) {
+        return safeEdit(ctx,
+            `⚠️ Railway TCP-proxy не настроен.\n\n` +
+            `Откройте Settings → Networking → TCP Proxy в Railway-сервисе и укажите внутренний порт <code>${ENV.PROXY_LISTEN_PORT}</code>.\n\n` +
+            `После активации Railway автоматически выдаст домен и порт.`,
+            Markup.inlineKeyboard([[btn('⬅️ Назад', 'adm:domain')]])
+        );
+    }
+    setProxyDomain(RW_TCP_DOMAIN);
+    setProxyPort(RW_TCP_PORT);
+    return safeEdit(ctx,
+        `<tg-emoji emoji-id="5870633910337015697">✅</tg-emoji> Применён Railway TCP-proxy:\n` +
+        `<code>${esc(RW_TCP_DOMAIN)}:${RW_TCP_PORT}</code>\n\n` +
+        `Игроки подключаются по: <code>&lt;subdomain&gt;.${esc(RW_TCP_DOMAIN)}:${RW_TCP_PORT}</code>`,
+        Markup.inlineKeyboard([
+            [btn('⬅️ В админку', 'adm:open')],
+        ])
+    );
+});
+
+bot.action('adm:domain:reset', async (ctx) => {
+    await ctx.answerCbQuery().catch(() => {});
+    if (!isAdmin(ctx.from.id)) return;
+    ctx.session.domainWait = null;
+    db.prepare(`DELETE FROM settings WHERE key IN ('proxy_domain','proxy_port')`).run();
+    return safeEdit(ctx,
+        `<tg-emoji emoji-id="5870633910337015697">✅</tg-emoji> Сброшено. Текущий домен: <code>${esc(getProxyDomain())}</code>:<code>${getProxyPort()}</code>`,
+        Markup.inlineKeyboard([[btn('⬅️ В админку', 'adm:open')]])
+    );
+});
+
+// ---------------------------------------------------------------
+// Admin: AUTO-OPEN PORTS
+// ---------------------------------------------------------------
+// На self-host: открывает PROXY_PORT (TCP+UDP) через ufw/iptables.
+// На Railway: проверяет, что TCP-proxy включён, и подсказывает действия.
+bot.action('adm:autoopen', async (ctx) => {
+    await ctx.answerCbQuery().catch(() => {});
+    if (!isAdmin(ctx.from.id)) return;
+    await safeEdit(ctx, '🔌 Открываю необходимые порты…');
+    const lines = [];
+    const port = ENV.PROXY_LISTEN_PORT || ENV.PROXY_PORT;
+
+    if (ENV.ON_RAILWAY) {
+        lines.push('🚂 <b>Railway:</b>');
+        if (RW_TCP_DOMAIN && RW_TCP_PORT) {
+            lines.push(`   ✅ TCP-proxy активен: <code>${esc(RW_TCP_DOMAIN)}:${RW_TCP_PORT}</code> → внутренний <code>${RW_INTERNAL_TCP_PORT}</code>`);
+            lines.push(`   ✅ Порт <code>${RW_INTERNAL_TCP_PORT}</code> уже проброшен Railway автоматически.`);
+            // Если ещё не записано в settings — применим
+            if (!getSetting('proxy_domain')) {
+                setProxyDomain(RW_TCP_DOMAIN);
+                setProxyPort(RW_TCP_PORT);
+                lines.push(`   ✅ Домен бота автоматически переключён на Railway TCP-proxy.`);
+            }
+        } else {
+            lines.push(`   ⚠️ TCP-proxy не активирован в Railway.`);
+            lines.push(`   👉 Включите: Service → Settings → Networking → <b>TCP Proxy</b>`);
+            lines.push(`   👉 Укажите внутренний порт: <code>${port}</code>`);
+            lines.push(`   👉 После активации нажмите кнопку «🚂 Авто (Railway TCP-proxy)» в разделе «Сменить домен».`);
+        }
+    } else {
+        // Self-host: открываем порт через firewall
+        lines.push('🖥 <b>Self-host:</b>');
+        const r = await firewallOpenPort(port);
+        if (r.ok) {
+            lines.push(`   ✅ Порт <code>${port}/tcp+udp</code> открыт в файрволе:`);
+            const out = (r.output || '').slice(-800);
+            if (out.trim()) lines.push(`   <pre>${esc(out)}</pre>`);
+        } else {
+            lines.push(`   ⚠️ Не удалось открыть порт: ${esc(r.output || '?')}`);
+        }
+        // Проверим извне
+        try {
+            const ip = await getPublicIp();
+            if (ip) {
+                const open = await isPortOpenPublic(ip, port);
+                lines.push(open
+                    ? `   🌍 Извне на <code>${esc(ip)}:${port}</code>: <b>открыт</b> ✅`
+                    : `   🌍 Извне на <code>${esc(ip)}:${port}</code>: <b>закрыт</b> — проверьте файрвол хостинга / Docker (<code>-p ${port}:${port}/tcp</code>)`);
+            }
+        } catch {}
+    }
+    return safeEdit(ctx,
+        `🔌 <b>Авто-открытие портов</b>\n\n${lines.join('\n')}`,
+        Markup.inlineKeyboard([
+            [btn('🔄 Повторить', 'adm:autoopen')],
+            [btn('⬅️ В админку', 'adm:open')],
+        ])
+    );
+});
+
+// ---------------------------------------------------------------
+// Admin: Railway info panel
+// ---------------------------------------------------------------
+bot.action('adm:railway', async (ctx) => {
+    await ctx.answerCbQuery().catch(() => {});
+    if (!isAdmin(ctx.from.id)) return;
+    const env = process.env;
+    const rows = [
+        ['Project',     env.RAILWAY_PROJECT_NAME || env.RAILWAY_PROJECT_ID || '—'],
+        ['Environment', env.RAILWAY_ENVIRONMENT_NAME || '—'],
+        ['Service',     env.RAILWAY_SERVICE_NAME || '—'],
+        ['Region',      env.RAILWAY_REPLICA_REGION || '—'],
+        ['Replica',     env.RAILWAY_REPLICA_ID || '—'],
+        ['Public HTTP', env.RAILWAY_PUBLIC_DOMAIN || '—'],
+        ['TCP domain',  RW_TCP_DOMAIN || '⚠️ not set'],
+        ['TCP port',    RW_TCP_PORT ? String(RW_TCP_PORT) : '⚠️ not set'],
+        ['Internal',    String(RW_INTERNAL_TCP_PORT || '—')],
+        ['Volume',      RW_VOLUME || '—'],
+    ];
+    const txt = rows.map(([k, v]) => `<b>${esc(k)}:</b> <code>${esc(v)}</code>`).join('\n');
+    return safeEdit(ctx,
+        `🚂 <b>Railway info</b>\n\n${txt}\n\n` +
+        `Текущая публичная точка входа: <code>${esc(getProxyDomain())}:${getProxyPort()}</code>`,
+        Markup.inlineKeyboard([
+            [btn('🔌 Авто-открыть порты', 'adm:autoopen')],
+            [btn('🌐 Сменить домен',    'adm:domain')],
+            [btn('🔄 Обновить',         'adm:railway')],
+            [btn('⬅️ В админку',        'adm:open')],
+        ])
+    );
+});
+
+
 // =====================================================================
 // 13. GRACEFUL SHUTDOWN
 // =====================================================================
@@ -5358,7 +5669,9 @@ async function shutdown(signal) {
     for (const [, st] of RUNNING) {
         try { st.child.stdin.write('stop\n'); } catch {}
     }
-    const deadline = Date.now() + 8000;
+    // Railway sends SIGTERM and waits RAILWAY_DEPLOYMENT_DRAINING_SECONDS (default 0).
+    // Дадим серверам максимум 12s корректно завершиться.
+    const deadline = Date.now() + 12_000;
     while (RUNNING.size && Date.now() < deadline) {
         await new Promise((r) => setTimeout(r, 200));
     }
@@ -5374,7 +5687,10 @@ process.once('SIGTERM', () => shutdown('SIGTERM'));
 // 14. LAUNCH
 // =====================================================================
 
-bot.launch().then(async () => {
+bot.launch({
+    dropPendingUpdates: true,
+    allowedUpdates: ['message', 'callback_query'],
+}).then(async () => {
     log.info('🤖 Bot started. Admin ID:', ENV.ADMIN_ID);
     log.info('   Default model:', getSetting('ai_model'));
     log.info('   Servers root:', ENV.SERVERS_ROOT);
@@ -5390,6 +5706,36 @@ bot.launch().then(async () => {
     log.info('   javac:', ENV.JAVAC_BIN || '<not found>');
     // ─── ЗАПУСК MC REVERSE-PROXY ───
     await startMcProxy();
+
+    // ─── АВТО-ОТКРЫТИЕ ПОРТОВ (Auto-open required ports) ───
+    // На Railway: проверяем, что TCP-proxy активен, и автоматически
+    // прописываем его в settings как публичный адрес.
+    // На self-host: открываем PROXY_PORT через ufw/iptables.
+    (async () => {
+        try {
+            const listenPort = ENV.PROXY_LISTEN_PORT || ENV.PROXY_PORT;
+            if (ENV.ON_RAILWAY) {
+                if (RW_TCP_DOMAIN && RW_TCP_PORT) {
+                    log.info(`   🚂 Railway TCP-proxy detected: ${RW_TCP_DOMAIN}:${RW_TCP_PORT} → :${listenPort}`);
+                    if (!getSetting('proxy_domain')) {
+                        setProxyDomain(RW_TCP_DOMAIN);
+                        setProxyPort(RW_TCP_PORT);
+                        log.info(`   🚂 Auto-set proxy_domain=${RW_TCP_DOMAIN}, proxy_port=${RW_TCP_PORT} (override via Admin Panel → Сменить домен)`);
+                    }
+                } else {
+                    log.warn(`   ⚠️  Railway: TCP-proxy is NOT enabled. Enable it in Service Settings → Networking → TCP Proxy, internal port = ${listenPort}.`);
+                }
+            } else if (ENV.PROXY_ENABLED) {
+                // Self-host: пытаемся открыть порт в файрволе (best-effort).
+                const r = await firewallOpenPort(listenPort);
+                if (r.ok) log.info(`   🔓 Auto-opened firewall port ${listenPort}/tcp+udp.`);
+                else      log.warn(`   ⚠️  Could not auto-open port ${listenPort}: ${(r.output || '').slice(0, 200)}`);
+            }
+        } catch (e) {
+            log.warn('Auto port-open failed:', e.message);
+        }
+    })();
+
     // ─── АВТОУСТАНОВКА ВСЕГО НУЖНОГО ПРИ СТАРТЕ (в фоне) ───
     // 1) Базовые OS-утилиты (unzip / tar / curl / wget / gpg)
     ensureSystemTools().catch((e) => log.warn('ensureSystemTools error:', e.message));

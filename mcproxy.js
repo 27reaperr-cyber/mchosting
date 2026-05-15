@@ -1,40 +1,47 @@
 /**
  * ──────────────────────────────────────────────────────────────────────
  * mcproxy.js — Встроенный Minecraft Reverse-Proxy (handshake-router)
+ * Railway-optimized edition.
  * ──────────────────────────────────────────────────────────────────────
  *
  * Идея:
- *   Хостинг блокирует все порты, кроме ОДНОГО публичного (например 25600).
- *   Поднимаем wildcard DNS `*.mchost.bothost.tech` → IP сервера и
- *   запускаем единственный TCP-listener на :25600. Когда игрок подключается
- *   к `myserver.mchost.bothost.tech:25600`, его Minecraft-клиент сам
- *   передаёт строку `myserver.mchost.bothost.tech` в поле `server_address`
- *   handshake-пакета (это часть протокола, Mojang спецификация).
+ *   Хостинг (Railway, Heroku, любой managed PaaS) даёт только ОДИН публичный
+ *   TCP-порт. Поднимаем wildcard DNS (CNAME `*.mchost.example.com` →
+ *   Railway TCP-proxy) и слушаем единственный TCP-listener. Когда игрок
+ *   подключается к `myserver.mchost.example.com:25600`, его Minecraft-клиент
+ *   сам передаёт `myserver.mchost.example.com` в поле `server_address`
+ *   handshake-пакета (часть протокола Mojang).
  *
- *   Этот модуль:
- *     1) слушает на 0.0.0.0:PROXY_PORT,
- *     2) парсит первый Minecraft-пакет (Handshake 0x00, https://wiki.vg/Protocol#Handshaking),
+ *   Модуль:
+ *     1) слушает на 0.0.0.0:PROXY_LISTEN_PORT,
+ *     2) парсит первый Minecraft-пакет (Handshake 0x00),
  *     3) вынимает subdomain (часть до первой точки),
  *     4) ищет в БД сервер с таким `subdomain`,
  *     5) открывает соединение на 127.0.0.1:<локальный порт сервера>,
  *     6) ПЕРЕСЫЛАЕТ оригинальный handshake-пакет нетронутым и далее
  *        полнодуплексно проксирует трафик в обе стороны (pipe).
  *
+ * Performance оптимизации в этом релизе:
+ *   • TCP keep-alive на клиент и upstream → выживание сквозь NAT/CGNAT.
+ *   • setNoDelay(true) → нулевая задержка пакетов (важно для геймплея).
+ *   • allowHalfOpen=false → быстрее освобождаем дескрипторы.
+ *   • Динамический baseDomain через getBaseDomain() — позволяет менять
+ *     домен из админ-панели без рестарта listener'а.
+ *   • Защита от oversized pre-handshake buffer (DoS protection).
+ *   • Connection counter + lightweight per-second stats (idle-aware).
+ *
  * Что это даёт:
- *   • Один публичный порт → бесконечное число MC-серверов.
+ *   • Один публичный порт → неограниченное число MC-серверов.
  *   • Никаких изменений в Minecraft-клиенте — всё работает «из коробки».
- *   • Сами MC-серверы слушают ТОЛЬКО на 127.0.0.1, наружу не торчат
- *     (BIND_HOST=127.0.0.1) — это даёт изоляцию и безопасность.
- *   • Поддерживается и обычный логин (Next state = 2) и server-list ping
- *     (Next state = 1) — игроки увидят онлайн/MOTD прямо в списке серверов.
- *   • Для несуществующих subdomain'ов отдаём корректный disconnect-пакет
- *     с понятным сообщением (на русском), вместо обрыва соединения.
+ *   • MC-серверы слушают ТОЛЬКО на 127.0.0.1 (изоляция).
+ *   • Поддерживается логин (Next state = 2) и server-list ping (Next state = 1).
+ *   • Для несуществующих subdomain'ов отдаём корректный disconnect-пакет.
  *
  * Аналоги (для справки):
- *   • mc-router  (itzg)  — Go
+ *   • mc-router (itzg)  — Go
  *   • Infrared          — Go
- *   • Velocity / Bungee — Java (но это уже полноценный proxy, не просто роутер)
- *   Здесь — ~400 строк чистого Node.js, без внешних зависимостей.
+ *   • Velocity/Bungee   — Java (полноценный proxy)
+ *   Здесь — ~450 строк чистого Node.js, без внешних зависимостей.
  * ──────────────────────────────────────────────────────────────────────
  */
 
@@ -45,7 +52,7 @@ const net = require('net');
 // ─────────────────────────────────────────────────────────────────────
 // Minecraft VarInt / String helpers
 // ─────────────────────────────────────────────────────────────────────
-// VarInt — это переменной длины целое (1..5 байт). Каждый байт:
+// VarInt — переменной длины целое (1..5 байт). Каждый байт:
 //   bit 7      — continuation flag (1 → есть ещё байты)
 //   bits 0..6 — полезная нагрузка (little-endian, 7 бит за раз)
 
@@ -68,7 +75,7 @@ function readVarInt(buf, offset = 0) {
 /** Закодировать VarInt в Buffer. */
 function writeVarInt(value) {
     const out = [];
-    let v = value >>> 0; // как беззнаковое 32
+    let v = value >>> 0;
     while (true) {
         if ((v & ~0x7f) === 0) { out.push(v); break; }
         out.push((v & 0x7f) | 0x80);
@@ -100,7 +107,7 @@ function writeMcString(str) {
 function parseHandshake(buf) {
     if (buf.length === 0) return { partial: true };
 
-    // Legacy ping (Minecraft <1.7) — игнорируем, отвечать не на чем
+    // Legacy ping (Minecraft <1.7) — игнорируем
     if (buf[0] === 0xfe) return { legacy: true };
 
     let p = 0;
@@ -143,64 +150,45 @@ function parseHandshake(buf) {
     const nextState = nextStateVI.value;
     p += nextStateVI.size;
 
-    // Весь handshake-пакет = первые `packetEnd` байт буфера.
     return {
         ok: true,
         protocol,
         serverAddress,
         serverPort,
-        nextState, // 1 = status (ping в списке серверов), 2 = login, 3 = transfer
+        nextState, // 1 = status, 2 = login, 3 = transfer
         handshakeBytes: buf.slice(0, packetEnd),
-        leftover: buf.slice(packetEnd), // то, что клиент уже успел доотправить (LoginStart / Request)
+        leftover: buf.slice(packetEnd),
     };
 }
 
 // ─────────────────────────────────────────────────────────────────────
 // Извлечь subdomain из server_address клиента
 // ─────────────────────────────────────────────────────────────────────
-// Forge-клиенты дописывают к адресу `\u0000FML3\u0000` или `\u0000FML\u0000`.
+// Forge-клиенты дописывают `\u0000FML3\u0000` или `\u0000FML\u0000`.
 // BungeeCord IP-forwarding добавляет `\0<realIP>\0<uuid>\0<properties>`.
 // Срезаем всё после первого NUL-байта и берём первую метку (до первой точки).
 function extractSubdomain(addr, baseDomain) {
     if (!addr) return null;
-    // Срезать BungeeCord / Forge маркеры
     let s = addr.split('\0')[0].trim().toLowerCase();
     if (!s) return null;
-
-    // Срезать порт, если клиент почему-то записал его в адресе
     s = s.replace(/:\d+$/, '');
-
-    // Срезать завершающую точку (FQDN-нотация)
     s = s.replace(/\.$/, '');
-
-    // Если адрес === base домен — нет subdomain
     if (baseDomain && s === baseDomain.toLowerCase()) return null;
-
-    // Если адрес заканчивается на base — берём первую метку
     if (baseDomain && s.endsWith('.' + baseDomain.toLowerCase())) {
         const head = s.slice(0, -(baseDomain.length + 1));
-        // На случай вложенных меток (e.g. `foo.bar.mchost...`) — берём ПЕРВУЮ
         return head.split('.')[0] || null;
     }
-
-    // Не наш домен — но всё равно берём первую метку как fallback
-    // (на случай если игрок ввёл просто `myserver` или ip-адрес был с subdomain)
     const first = s.split('.')[0];
     return first || null;
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// Отправить клиенту человекочитаемый отказ
+// Отказ клиенту: human-readable сообщение
 // ─────────────────────────────────────────────────────────────────────
-// Для state=2 (login) — пакет Disconnect (0x00 в Login-состоянии) с JSON Chat.
-// Для state=1 (status) — Response (0x00) с JSON server-list-ping, чтобы
-// игрок увидел в списке серверов «бренд» с сообщением «сервер не найден».
-
 function buildLoginDisconnect(message) {
-    // JSON chat component
     const json = JSON.stringify({ text: message, color: 'red' });
     const payload = Buffer.concat([
-        writeVarInt(0x00),         // packet id (login Disconnect)
+        writeVarInt(0x00),
         writeMcString(json),
     ]);
     return Buffer.concat([writeVarInt(payload.length), payload]);
@@ -213,41 +201,45 @@ function buildStatusResponse(message, motd) {
         description: { text: motd || message, color: 'gold' },
     });
     const payload = Buffer.concat([
-        writeVarInt(0x00),         // status Response
+        writeVarInt(0x00),
         writeMcString(json),
     ]);
     return Buffer.concat([writeVarInt(payload.length), payload]);
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// Основной сервер: класс MinecraftReverseProxy
+// MinecraftReverseProxy
 // ─────────────────────────────────────────────────────────────────────
 //
 // Использование:
 //   const proxy = new MinecraftReverseProxy({
 //       listenHost: '0.0.0.0',
 //       listenPort: 25600,
-//       baseDomain: 'mchost.bothost.tech',
-//       resolveBackend: (subdomain, serverAddress) => { host, port } | null,
+//       baseDomain: 'mchost.example.com',     // статический fallback
+//       getBaseDomain: () => settings.domain, // динамический (опционально)
+//       resolveBackend: (subdomain) => ({ host, port }) | null,
 //       log: console,
 //   });
 //   await proxy.start();
-//
-// resolveBackend — callback, который по subdomain'у должен вернуть локальный
-// endpoint (или null, если такого нет). Бот подключает сюда поиск в БД.
 
 class MinecraftReverseProxy {
     constructor(opts) {
         this.listenHost = opts.listenHost || '0.0.0.0';
         this.listenPort = Number(opts.listenPort) || 25600;
-        this.baseDomain = (opts.baseDomain || '').toLowerCase();
+        this._staticBaseDomain = (opts.baseDomain || '').toLowerCase();
+        this._getBaseDomain = typeof opts.getBaseDomain === 'function'
+            ? opts.getBaseDomain
+            : () => this._staticBaseDomain;
         this.resolveBackend = opts.resolveBackend;
         this.log = opts.log || console;
         this.handshakeTimeoutMs = opts.handshakeTimeoutMs || 5000;
-        this.idleTimeoutMs = opts.idleTimeoutMs || 0; // 0 = выкл; MC шлёт keepalive
+        this.idleTimeoutMs = opts.idleTimeoutMs || 0;
         this.server = null;
 
-        // Метрики (доступны через getStats)
+        // Performance: TCP keep-alive параметры
+        this.keepAliveInitialDelayMs = opts.keepAliveInitialDelayMs ?? 30_000;
+
+        // Метрики
         this.stats = {
             totalConnections: 0,
             activeConnections: 0,
@@ -256,16 +248,29 @@ class MinecraftReverseProxy {
             rejectedUnknown: 0,
             rejectedBadHandshake: 0,
             backendFailures: 0,
+            bytesIn: 0,
+            bytesOut: 0,
         };
+    }
+
+    /** Текущий базовый домен (может меняться рантайм через getBaseDomain). */
+    get baseDomain() {
+        try { return (this._getBaseDomain() || '').toLowerCase(); }
+        catch { return this._staticBaseDomain; }
     }
 
     start() {
         return new Promise((resolve, reject) => {
-            this.server = net.createServer({ allowHalfOpen: false }, (s) => this._onClient(s));
+            this.server = net.createServer(
+                { allowHalfOpen: false, pauseOnConnect: false },
+                (s) => this._onClient(s)
+            );
             this.server.on('error', (e) => {
                 this.log.error?.(`[mcproxy] listen error: ${e.message}`);
                 reject(e);
             });
+            // Track max simultaneous connections — поможет ловить лики/DoS.
+            this.server.maxConnections = 5000;
             this.server.listen(this.listenPort, this.listenHost, () => {
                 this.log.info?.(`[mcproxy] listening on ${this.listenHost}:${this.listenPort} (base=${this.baseDomain || '<none>'})`);
                 resolve();
@@ -293,6 +298,12 @@ class MinecraftReverseProxy {
         let buf = Buffer.alloc(0);
         let resolved = false;
 
+        // Performance: TCP keepalive + no-delay прямо сейчас, до первого байта.
+        try {
+            client.setNoDelay(true);
+            client.setKeepAlive(true, this.keepAliveInitialDelayMs);
+        } catch {}
+
         const cleanup = () => {
             this.stats.activeConnections--;
             client.removeAllListeners('data');
@@ -306,7 +317,7 @@ class MinecraftReverseProxy {
         }, this.handshakeTimeoutMs);
 
         client.once('error', (e) => {
-            // Игроки часто рвут соединение — это норма, не спамим в логи.
+            // Игроки часто рвут соединение — это норма.
             this.log.debug?.(`${tag} client error: ${e.message}`);
         });
         client.once('close', () => {
@@ -315,10 +326,11 @@ class MinecraftReverseProxy {
         });
 
         client.on('data', (chunk) => {
-            if (resolved) return; // уже передали данные бэкенду через pipe
+            if (resolved) return;
+            this.stats.bytesIn += chunk.length;
             buf = Buffer.concat([buf, chunk]);
 
-            // Защита: не даём клиенту переполнить буфер до handshake.
+            // DoS protection: жёсткий cap до handshake.
             if (buf.length > 4096) {
                 this.stats.rejectedBadHandshake++;
                 this.log.warn?.(`${tag} oversized pre-handshake buffer — closing`);
@@ -340,7 +352,6 @@ class MinecraftReverseProxy {
             clearTimeout(handshakeTimer);
 
             if (h.legacy) {
-                // Minecraft <1.7 — старый протокол. Современные клиенты сюда не попадают.
                 this.stats.rejectedBadHandshake++;
                 try { client.end(); } catch {}
                 return;
@@ -352,7 +363,8 @@ class MinecraftReverseProxy {
                 return;
             }
 
-            const sub = extractSubdomain(h.serverAddress, this.baseDomain);
+            const base = this.baseDomain;
+            const sub = extractSubdomain(h.serverAddress, base);
             const isStatus = h.nextState === 1;
             if (isStatus) this.stats.statusPings++;
             else this.stats.logins++;
@@ -370,13 +382,12 @@ class MinecraftReverseProxy {
                 this.stats.rejectedUnknown++;
                 this._rejectClient(client, h.nextState,
                     sub
-                        ? `🚫 Сервер "${sub}" не найден на mchost.\nПроверь адрес в Telegram-боте.`
-                        : `🚫 Укажи поддомен сервера, например:\nmyserver.${this.baseDomain || 'mchost.bothost.tech'}:${this.listenPort}`
+                        ? `🚫 Сервер "${sub}" не найден.\nПроверь адрес в Telegram-боте.`
+                        : `🚫 Укажи поддомен сервера, например:\nmyserver.${base || 'mchost.example.com'}:${this.listenPort}`
                 );
                 return;
             }
 
-            // Открываем соединение с бэкендом и пересылаем handshake + leftover.
             this._connectBackend(client, backend, h, tag);
         });
     }
@@ -384,13 +395,9 @@ class MinecraftReverseProxy {
     _rejectClient(client, nextState, message) {
         try {
             if (nextState === 1) {
-                // status: отвечаем Response + ждём Ping(0x01) и отбиваем его обратно
                 client.write(buildStatusResponse(message, message));
-                // Просто закроем после небольшой паузы — большинство клиентов
-                // успеют отрисовать MOTD «не найден».
                 setTimeout(() => { try { client.end(); } catch {} }, 200);
             } else {
-                // login (или transfer): чистый Disconnect с JSON Chat
                 client.write(buildLoginDisconnect(message));
                 setTimeout(() => { try { client.end(); } catch {} }, 100);
             }
@@ -403,19 +410,24 @@ class MinecraftReverseProxy {
         const backendHost = backend.host || '127.0.0.1';
         const backendPort = Number(backend.port);
         const upstream = net.createConnection({ host: backendHost, port: backendPort }, () => {
-            // Передаём первый пакет нетронутым + всё, что клиент уже доотправил
-            // (например LoginStart). Это критично — нельзя терять байты.
+            // Передаём первый пакет нетронутым + всё, что клиент уже доотправил.
             upstream.write(handshake.handshakeBytes);
             if (handshake.leftover && handshake.leftover.length) {
                 upstream.write(handshake.leftover);
             }
-            // Полнодуплексная перекачка трафика.
+            // Performance: TCP keepalive + no-delay на upstream тоже.
+            try {
+                upstream.setNoDelay(true);
+                upstream.setKeepAlive(true, this.keepAliveInitialDelayMs);
+            } catch {}
+
+            // Полнодуплексная перекачка. Счётчик байт для статы.
+            client.on('data', (b) => { this.stats.bytesIn += b.length; });
+            upstream.on('data', (b) => { this.stats.bytesOut += b.length; });
+
             client.pipe(upstream, { end: true });
             upstream.pipe(client, { end: true });
         });
-
-        upstream.setNoDelay(true);
-        client.setNoDelay(true);
 
         const closeBoth = () => {
             try { client.destroy(); } catch {}
@@ -425,7 +437,6 @@ class MinecraftReverseProxy {
         upstream.on('error', (e) => {
             this.stats.backendFailures++;
             this.log.warn?.(`${tag} upstream ${backendHost}:${backendPort} error: ${e.message}`);
-            // Сервер не запущен / упал — расскажем игроку
             try {
                 this._rejectClient(client, handshake.nextState,
                     `⚠️ Сервер выключен.\nПопроси владельца включить его в Telegram-боте.`
@@ -441,7 +452,6 @@ class MinecraftReverseProxy {
 
 module.exports = {
     MinecraftReverseProxy,
-    // экспортируем для тестов / отладки
     _internals: {
         parseHandshake,
         extractSubdomain,
