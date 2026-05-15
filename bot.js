@@ -28,7 +28,6 @@
 
 'use strict';
 
-require('dotenv').config();
 
 const fs = require('fs');
 const fsp = require('fs/promises');
@@ -69,7 +68,7 @@ const ENV = {
     if (!ENV.ONLYSQ_API_KEY) missing.push('ONLYSQ_API_KEY');
     if (missing.length) {
         console.error('❌ Missing required env vars: ' + missing.join(', '));
-        console.error('   Copy .env.example → .env and fill in the values.');
+        console.error('   Задайте переменные окружения через панель хостинга.');
         process.exit(1);
     }
 })();
@@ -597,7 +596,7 @@ function tailString(s, max = 4000) {
 
 async function startServer(server, ctx) {
     if (RUNNING.has(server.id)) {
-        await ctx.reply('⚠️ Сервер уже запущен.').catch(() => {});
+        await ctx.reply('<tg-emoji emoji-id="5870982283724328568">⚠️</tg-emoji> Сервер уже запущен.').catch(() => {});
         return;
     }
 
@@ -615,16 +614,15 @@ async function startServer(server, ctx) {
         } else {
             ENV.JAVA_AVAILABLE = false;
             await ctx.reply(
-                '❌ <b>Java не найдена на этом хосте.</b>\n\n' +
+                '<tg-emoji emoji-id="5870657884844462243">❌</tg-emoji> <b>Java не найдена на этом хосте.</b>\n\n' +
                 'Бот не может запустить Minecraft-сервер, потому что в системе ' +
                 'отсутствует исполняемый файл <code>java</code>.\n\n' +
                 '<b>Что сделать:</b>\n' +
                 '• Ubuntu/Debian: <code>sudo apt update &amp;&amp; sudo apt install -y openjdk-21-jre-headless</code>\n' +
                 '• Alpine: <code>apk add openjdk21-jre</code>\n' +
                 '• Docker: используйте базовый образ <code>eclipse-temurin:21-jre</code>\n\n' +
-                'После установки укажите путь в <code>.env</code>:\n' +
-                '<code>JAVA_BIN=/usr/bin/java</code>\n' +
-                'или экспортируйте <code>JAVA_HOME</code>, и перезапустите бота.',
+                '<tg-emoji emoji-id="6028435952299413210">ℹ</tg-emoji> Укажите переменную окружения <code>JAVA_BIN=/usr/bin/java</code>\n' +
+                'или экспортируйте <code>JAVA_HOME</code> и перезапустите бота.',
                 { parse_mode: 'HTML' }
             ).catch(() => {});
             return;
@@ -695,7 +693,7 @@ async function startServer(server, ctx) {
         if (/ENOENT/i.test(e.message)) {
             hint =
                 '\n\n<i>Похоже, исполняемый файл <code>java</code> недоступен. ' +
-                'Установите OpenJDK 17+ и пропишите путь в <code>JAVA_BIN</code> в <code>.env</code>.</i>';
+                'Установите OpenJDK 21+ и задайте переменную окружения <code>JAVA_BIN</code> через хостинг.</i>';
         }
         ctx.telegram.sendMessage(
             state.chatId,
@@ -718,7 +716,7 @@ async function startServer(server, ctx) {
                 const verdict = await aiAnalyseStartup(tail, server);
                 await ctx.telegram.sendMessage(
                     state.chatId,
-                    `🤖 <b>AI-разбор завершения сервера:</b>\n${esc(verdict)}`,
+                    `<tg-emoji emoji-id="6030400221232501136">🤖</tg-emoji> <b>AI-разбор завершения сервера:</b>\n${esc(verdict)}`,
                     { parse_mode: 'HTML' }
                 ).catch(() => {});
             } catch (e) { log.warn('AI post-mortem failed:', e.message); }
@@ -732,14 +730,14 @@ async function startServer(server, ctx) {
             const verdict = await aiAnalyseStartup(st.bootLogForAI, server);
             ctx.telegram.sendMessage(
                 st.chatId,
-                `🤖 <b>AI-диагностика запуска (20 сек):</b>\n${esc(verdict)}`,
+                `<tg-emoji emoji-id="6030400221232501136">🤖</tg-emoji> <b>AI-диагностика запуска (20 сек):</b>\n${esc(verdict)}`,
                 { parse_mode: 'HTML' }
             ).catch(() => {});
         } catch (e) { log.warn('AI boot-check failed:', e.message); }
     }, 20_000);
 
     await ctx.reply(
-        `🚀 Сервер «<b>${esc(server.name)}</b>» запускается…\n` +
+        `<tg-emoji emoji-id="5963103826075456248">🚀</tg-emoji> Сервер «<b>${esc(server.name)}</b>» запускается…\n` +
         `Лог появится через несколько секунд.`,
         {
             parse_mode: 'HTML',
@@ -1049,7 +1047,7 @@ bot.use(async (ctx, next) => {
     if (!u) return next();
     if (!hasAccess(u.id, u.username)) {
         const txt =
-            `🚫 Доступ к боту ограничен.\n` +
+            `<tg-emoji emoji-id="6037249452824072506">🔒</tg-emoji> Доступ к боту ограничен.\n` +
             `Ваш Telegram ID: <code>${esc(u.id)}</code>\n` +
             `Попросите администратора выдать доступ.`;
         // Answer callback if any, then send a plain message
@@ -1107,7 +1105,7 @@ function mainMenuKeyboard(ctx) {
 
 function mainMenuText(ctx) {
     return (
-        `👋 Привет, <b>${esc(ctx.from.first_name || 'пользователь')}</b>!\n\n` +
+        `<tg-emoji emoji-id="5870764288364252592">🙂</tg-emoji> Привет, <b>${esc(ctx.from.first_name || 'пользователь')}</b>!\n\n` +
         `Я помогу установить и запустить Minecraft-сервер ` +
         `(Bukkit / Spigot / Paper) и интегрирую AI-помощника от OnlySQ.\n\n` +
         `Выберите действие:`
@@ -1121,14 +1119,14 @@ bot.start(async (ctx) => {
 
 bot.command('cancel', async (ctx) => {
     ctx.session = {};
-    await ctx.reply('✖️ Операция отменена.', mainMenuKeyboard(ctx));
+    await ctx.reply('<tg-emoji emoji-id="5870657884844462243">❌</tg-emoji> Операция отменена.', { parse_mode: 'HTML', ...mainMenuKeyboard(ctx) });
 });
 
 bot.command('java', async (ctx) => {
     // Quick diagnostic: report Java availability without trying to start a server.
     if (ENV.JAVA_AVAILABLE) {
         return ctx.reply(
-            `✅ Java найдена.\n` +
+            `<tg-emoji emoji-id="5870633910337015697">✅</tg-emoji> Java найдена.\n` +
             `Путь: <code>${esc(ENV.JAVA_BIN)}</code>\n` +
             `Версия: <code>${esc(ENV.JAVA_VERSION_STR || 'unknown')}</code>\n` +
             `javac: ${ENV.JAVAC_BIN ? `<code>${esc(ENV.JAVAC_BIN)}</code>` : '<i>не найден</i>'}`,
@@ -1136,7 +1134,7 @@ bot.command('java', async (ctx) => {
         );
     }
     return ctx.reply(
-        `❌ Java не найдена. Запуск серверов невозможен.\n` +
+        `<tg-emoji emoji-id="5870657884844462243">❌</tg-emoji> Java не найдена. Запуск серверов невозможен.\n` +
         `Проверено: <code>JAVA_BIN=${esc(ENV.JAVA_BIN)}</code>, $JAVA_HOME, $PATH, /usr/lib/jvm/*.\n` +
         `Установите OpenJDK 21 и пропишите путь в .env.`,
         { parse_mode: 'HTML' }
@@ -1266,7 +1264,7 @@ bot.on('text', async (ctx, next) => {
                     { parse_mode: 'HTML' });
             } else if (r.kind === 'username') {
                 await ctx.reply(
-                    `✅ Доступ выдан @${esc(r.value)}. ` +
+                    `<tg-emoji emoji-id="5870633910337015697">✅</tg-emoji> Доступ выдан @${esc(r.value)}. ` +
                     `Когда пользователь напишет /start — он будет добавлен автоматически.`,
                     { parse_mode: 'HTML' }
                 );
@@ -1276,7 +1274,7 @@ bot.on('text', async (ctx, next) => {
         } else if (a.action === 'revoke') {
             const r = revokeAccess(text);
             if (r.ok) {
-                await ctx.reply(`✅ Доступ отозван (<code>${esc(r.value)}</code>).`,
+                await ctx.reply(`<tg-emoji emoji-id="5870633910337015697">✅</tg-emoji> Доступ отозван (<code>${esc(r.value)}</code>).`,
                     { parse_mode: 'HTML' });
             } else {
                 await ctx.reply(`⚠️ ${esc(r.reason || 'Не найден / нельзя удалить.')}`,
@@ -1322,7 +1320,7 @@ bot.on('text', async (ctx, next) => {
         ctx.session.wizard = null;
         try { await ctx.telegram.deleteMessage(ctx.chat.id, dlMsg.message_id); } catch {}
         await ctx.reply(
-            `✅ Сервер «<b>${esc(name)}</b>» (${esc(w.flavor)} ${esc(w.mcVersion)}) установлен.\n` +
+            `<tg-emoji emoji-id="5870633910337015697">✅</tg-emoji> Сервер «<b>${esc(name)}</b>» (${esc(w.flavor)} ${esc(w.mcVersion)}) установлен.\n` +
             `Папка: <code>${esc(dir)}</code>`,
             {
                 parse_mode: 'HTML',
@@ -1568,7 +1566,7 @@ async function handleAiGenerate(ctx, serverId, promptText) {
     }
 
     const waitMsg = await ctx.reply(
-        `🤖 AI (<code>${esc(getSetting('ai_model'))}</code>) анализирует сервер и пишет код…`,
+        `<tg-emoji emoji-id="6030400221232501136">🤖</tg-emoji> AI (<code>${esc(getSetting('ai_model'))}</code>) анализирует сервер и пишет код…`,
         { parse_mode: 'HTML' }
     );
 
@@ -1650,7 +1648,7 @@ async function handleAiGenerate(ctx, serverId, promptText) {
 
     const fileListMsg = writtenRel.map((p) => `• <code>${esc(p)}</code>`).join('\n');
     await ctx.reply(
-        `✨ <b>Готово!</b> AI сгенерировала (<i>${esc(result.type)}</i>):\n` +
+        `<tg-emoji emoji-id="6041731551845159060">🎉</tg-emoji> <b>Готово!</b> AI сгенерировала (<i>${esc(result.type)}</i>):\n` +
         fileListMsg +
         `\n\n📝 <b>Описание от AI:</b>\n<i>${esc(result.summary || '(пусто)')}</i>` +
         summaryExtra + extraNote,
@@ -1688,7 +1686,7 @@ async function handleIncomingFile(ctx, opts) {
         return ctx.reply('🚫 Это не ваш сервер.');
     }
 
-    const dlMsg = await ctx.reply('⬇️ Загружаю файл…');
+    const dlMsg = await ctx.reply('<tg-emoji emoji-id="6039802767931871481">⬇️</tg-emoji> Загружаю файл…');
 
     const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'mctgbot-'));
     let localFile, filename;
@@ -1723,7 +1721,7 @@ async function handleIncomingFile(ctx, opts) {
 
     await ctx.telegram.editMessageText(
         ctx.chat.id, dlMsg.message_id, undefined,
-        `🤖 Спрашиваю AI (модель: <code>${esc(getSetting('ai_model'))}</code>), куда положить файл…`,
+        `<tg-emoji emoji-id="6030400221232501136">🤖</tg-emoji> Спрашиваю AI (модель: <code>${esc(getSetting('ai_model'))}</code>), куда положить файл…`,
         { parse_mode: 'HTML' }
     ).catch(() => {});
 
@@ -1816,7 +1814,7 @@ function adminPanelKeyboard() {
 
 async function openAdminPanel(ctx) {
     if (!isAdmin(ctx.from.id)) return;
-    const text = '⚙️ <b>Админ-панель</b>';
+    const text = '<tg-emoji emoji-id="5870982283724328568">⚙️</tg-emoji> <b>Админ-панель</b>';
     if (ctx.callbackQuery) {
         return safeEdit(ctx, text, adminPanelKeyboard());
     }
@@ -1905,7 +1903,7 @@ bot.action(/^adm:setmodel:(.+)$/, async (ctx) => {
     const m = ctx.match[1];
     setSetting('ai_model', m);
     return safeEdit(ctx,
-        `✅ Модель AI установлена: <b>${esc(m)}</b>`,
+        `<tg-emoji emoji-id="5870633910337015697">✅</tg-emoji> Модель AI установлена: <b>${esc(m)}</b>`,
         adminPanelKeyboard()
     );
 });
