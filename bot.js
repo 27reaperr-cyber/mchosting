@@ -33,6 +33,8 @@ const fs = require('fs');
 const fsp = require('fs/promises');
 const path = require('path');
 const os = require('os');
+const net = require('net');
+const dns = require('dns').promises;
 const { spawn, spawnSync } = require('child_process');
 const { pipeline } = require('stream/promises');
 const { createWriteStream } = require('fs');
@@ -59,6 +61,15 @@ const ENV = {
     MAX_UPLOAD_MB: Number(process.env.MAX_UPLOAD_MB || 50),
     DB_PATH: path.resolve(process.env.DB_PATH || './data/bot.db'),
     PAPER_UA: process.env.PAPER_UA || 'mc-tg-bot/1.0.0 (+https://github.com/local)',
+    // Auto-port allocation range. Each new server gets a random free port
+    // from this range so multiple users never collide.
+    PORT_RANGE_MIN: Number(process.env.PORT_RANGE_MIN || 25600),
+    PORT_RANGE_MAX: Number(process.env.PORT_RANGE_MAX || 26600),
+    // Optional manual override for public IP — useful for VPS/NAT setups
+    // where ipify et al. return the wrong address.
+    PUBLIC_IP: process.env.PUBLIC_IP || '',
+    // Branding string appended to default MOTD; user can edit later.
+    BRAND_MOTD: process.env.BRAND_MOTD || 'made by @mchost_drbot',
 };
 
 (function validateEnv() {
@@ -214,6 +225,51 @@ function esc(v) {
 }
 
 /**
+ * Strip markdown / HTML formatting from raw AI output before showing it
+ * in Telegram. We use HTML parse_mode for our own messages, so we must NOT
+ * let the AI inject angle brackets or markdown stars — it would either
+ * render as broken HTML or escape into the user message.
+ *
+ * Rules:
+ *   - Remove ```fenced``` code blocks (keep their content).
+ *   - Strip `inline code` backticks (keep content).
+ *   - Strip **bold** and *italic* / __bold__ / _italic_ markers.
+ *   - Strip leading list markers like "- ", "* ", "1. ".
+ *   - Strip leading `#`/`##` headings.
+ *   - Replace HTML tags with their textual content.
+ *   - Collapse 3+ consecutive blank lines to 2.
+ */
+function stripAiFormatting(text) {
+    if (text === null || text === undefined) return '';
+    let s = String(text);
+    // Remove triple-backtick fences but keep their body
+    s = s.replace(/```[a-zA-Z0-9_+-]*\n?([\s\S]*?)```/g, (_, body) => body);
+    // Inline code
+    s = s.replace(/`([^`]+)`/g, '$1');
+    // Bold / italic
+    s = s.replace(/\*\*([^*]+)\*\*/g, '$1');
+    s = s.replace(/\*([^*\n]+)\*/g, '$1');
+    s = s.replace(/__([^_]+)__/g, '$1');
+    s = s.replace(/_([^_\n]+)_/g, '$1');
+    // Strikethrough
+    s = s.replace(/~~([^~]+)~~/g, '$1');
+    // Markdown links [text](url) -> "text (url)"
+    s = s.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '$1 ($2)');
+    // Headings
+    s = s.replace(/^\s{0,3}#{1,6}\s+/gm, '');
+    // Block-quotes
+    s = s.replace(/^\s{0,3}>\s?/gm, '');
+    // List markers
+    s = s.replace(/^\s{0,3}[-*+]\s+/gm, '• ');
+    s = s.replace(/^\s{0,3}\d+\.\s+/gm, '');
+    // Strip any leftover HTML tags
+    s = s.replace(/<\/?[a-zA-Z][^>]*>/g, '');
+    // Collapse excessive blank lines
+    s = s.replace(/\n{3,}/g, '\n\n');
+    return s.trim();
+}
+
+/**
  * Strip HTML noise from an error message and shorten it for logs/UI.
  * Many providers return a giant HTML 404 page that floods both logs
  * and chat messages — we condense it to something useful like
@@ -270,10 +326,25 @@ db.exec(`
         mc_version TEXT    NOT NULL,
         dir        TEXT    NOT NULL UNIQUE,
         jar        TEXT    NOT NULL,
+        port       INTEGER NOT NULL DEFAULT 25565,
+        slots      INTEGER NOT NULL DEFAULT 20,
+        motd       TEXT    NOT NULL DEFAULT '',
+        start_cmd  TEXT,
         created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
     );
     CREATE INDEX IF NOT EXISTS idx_servers_owner ON servers(owner_id);
 `);
+
+// Migrations: add columns for older databases. Each ALTER is wrapped in try/catch
+// so re-running on an already-migrated DB is a no-op.
+for (const stmt of [
+    `ALTER TABLE servers ADD COLUMN port      INTEGER NOT NULL DEFAULT 25565`,
+    `ALTER TABLE servers ADD COLUMN slots     INTEGER NOT NULL DEFAULT 20`,
+    `ALTER TABLE servers ADD COLUMN motd      TEXT    NOT NULL DEFAULT ''`,
+    `ALTER TABLE servers ADD COLUMN start_cmd TEXT`,
+]) {
+    try { db.exec(stmt); } catch { /* column already exists */ }
+}
 
 // Ensure admin from .env always has access
 db.prepare(
@@ -431,13 +502,24 @@ async function aiChat({ system, user, model, jsonMode = false, maxTokens = 1500 
     if (system) messages.push({ role: 'system', content: system });
     messages.push({ role: 'user', content: user });
     try {
+        // NOTE: response_format is NOT sent — OnlySQ/many providers don't support it
+        // and return 500. For JSON mode we instead instruct the model in the system
+        // prompt and extract JSON manually from the response text.
         const resp = await onlysq.chat.completions.create({
             model: m,
             messages,
             max_tokens: maxTokens,
-            ...(jsonMode ? { response_format: { type: 'json_object' } } : {}),
         });
-        return resp.choices?.[0]?.message?.content?.trim() ?? '';
+        const raw = resp.choices?.[0]?.message?.content?.trim() ?? '';
+        if (jsonMode) {
+            // Strip markdown fences if present, extract first JSON object/array
+            const cleaned = raw.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '').trim();
+            const match = cleaned.match(/(\{[\s\S]*\}|\[[\s\S]*\])/);
+            return match ? match[1] : cleaned;
+        }
+        // For human-facing output: strip markdown / HTML formatting so it
+        // can be safely shown inside our HTML-formatted Telegram messages.
+        return stripAiFormatting(raw);
     } catch (e) {
         // Clean up the message — OpenAI SDK includes raw HTML when provider returns 404.
         const brief = briefHttpError(e?.message || String(e));
@@ -489,30 +571,184 @@ const PaperAPI = {
     },
 };
 
-const GetBukkitAPI = {
+// ---------------------------------------------------------------
+// Spigot / Bukkit mirror.
+//
+// The original `download.getbukkit.org` host is frequently blocked or
+// returns DNS NXDOMAIN from many cloud providers. We use multiple
+// mirrors and fall back transparently:
+//   1) https://cdn.getbukkit.org/        (alternative CDN, usually up)
+//   2) https://download.getbukkit.org/   (original)
+//   3) https://serverjars.com/api/...    (well-maintained mirror with JSON API)
+//   4) Mojang BuildTools                 (last resort — compiles from source)
+//
+// `getServerVersions('spigot'|'bukkit')` returns a curated list of known
+// versions. `resolveServerDownload` then probes mirrors in order and
+// returns the first URL that responds with a HEAD 200.
+// ---------------------------------------------------------------
+const SpigotBukkitMirror = {
     KNOWN_VERSIONS: [
-        '1.21.1', '1.20.6', '1.20.4', '1.20.2', '1.20.1', '1.19.4', '1.19.2',
-        '1.18.2', '1.17.1', '1.16.5', '1.15.2', '1.14.4', '1.13.2', '1.12.2',
-        '1.11.2', '1.10.2', '1.9.4', '1.8.8',
+        '1.21.4', '1.21.3', '1.21.1', '1.21',
+        '1.20.6', '1.20.4', '1.20.2', '1.20.1', '1.20',
+        '1.19.4', '1.19.2', '1.19',
+        '1.18.2', '1.18.1', '1.18',
+        '1.17.1', '1.17',
+        '1.16.5', '1.16.4', '1.16.3', '1.16.1',
+        '1.15.2', '1.15.1', '1.15',
+        '1.14.4', '1.14.3', '1.14.2', '1.14.1',
+        '1.13.2', '1.13.1', '1.13',
+        '1.12.2', '1.12.1', '1.12',
+        '1.11.2', '1.11.1', '1.11',
+        '1.10.2', '1.10',
+        '1.9.4', '1.9.2', '1.9',
+        '1.8.8',
     ],
-    spigotUrl: (v) => `https://download.getbukkit.org/spigot/spigot-${v}.jar`,
-    bukkitUrl: (v) => `https://download.getbukkit.org/craftbukkit/craftbukkit-${v}.jar`,
 
     list() { return [...this.KNOWN_VERSIONS]; },
-    getDownload(flavor, version) {
-        if (flavor === 'spigot') return { url: this.spigotUrl(version), filename: `spigot-${version}.jar` };
-        if (flavor === 'bukkit') return { url: this.bukkitUrl(version), filename: `craftbukkit-${version}.jar` };
-        throw new Error('Unknown flavor: ' + flavor);
+
+    mirrorsFor(flavor, version) {
+        // Spigot file naming used by all mirrors
+        const spigotName  = `spigot-${version}.jar`;
+        const bukkitName  = `craftbukkit-${version}.jar`;
+        const fname       = flavor === 'spigot' ? spigotName : bukkitName;
+        // serverjars.com type names differ
+        const sjType      = flavor === 'spigot' ? 'spigot' : 'bukkit';
+        const urls = [];
+        if (flavor === 'spigot') {
+            urls.push(`https://cdn.getbukkit.org/spigot/${spigotName}`);
+            urls.push(`https://download.getbukkit.org/spigot/${spigotName}`);
+        } else {
+            urls.push(`https://cdn.getbukkit.org/craftbukkit/${bukkitName}`);
+            urls.push(`https://download.getbukkit.org/craftbukkit/${bukkitName}`);
+        }
+        urls.push(`https://serverjars.com/api/fetchJar/${sjType}/${version}`);
+        return { urls, filename: fname };
+    },
+
+    async getDownload(flavor, version) {
+        const { urls, filename } = this.mirrorsFor(flavor, version);
+        // Probe each mirror with HEAD (some servers don't support HEAD;
+        // we accept any 2xx OR a 405 (method not allowed) as a sign the
+        // URL exists, then trust the download phase to verify).
+        for (const url of urls) {
+            try {
+                const ok = await urlIsAlive(url);
+                if (ok) return { url, filename };
+            } catch { /* try next */ }
+        }
+        // No mirror responded — still return the first URL so the caller's
+        // download error message points to a concrete URL the user can debug.
+        return { url: urls[0], filename };
+    },
+};
+
+/** Best-effort "is this URL reachable" check used by mirror fallback. */
+async function urlIsAlive(url) {
+    // 1) DNS first — catches the "getaddrinfo ENOTFOUND" case fast.
+    try {
+        const host = new URL(url).hostname;
+        await dns.lookup(host);
+    } catch { return false; }
+    // 2) HEAD probe (short timeout). Some CDNs reject HEAD with 405
+    // but still serve GET correctly — we treat 405 as "alive".
+    try {
+        const res = await request(url, {
+            method: 'HEAD',
+            headers: { 'User-Agent': ENV.PAPER_UA },
+            headersTimeout: 4500,
+            bodyTimeout: 4500,
+            maxRedirections: 5,
+        });
+        res.body.dump?.();
+        return (res.statusCode >= 200 && res.statusCode < 400) || res.statusCode === 405;
+    } catch {
+        return false;
+    }
+}
+
+// ---------------------------------------------------------------
+// Forge (MinecraftForge) installer support.
+//
+// We use the official maven-metadata to list installers, then download
+// `forge-<mc>-<build>-installer.jar` and run it locally with
+// `java -jar installer.jar --installServer`. After installation we
+// detect the actual launch entrypoint:
+//   - Modern Forge (>= 1.17): a run.sh script + libraries/.../unix_args.txt
+//     (we use the args file with `java @args.txt nogui`).
+//   - Older Forge: a forge-<ver>-universal.jar in the install dir.
+// The result is stored in servers.start_cmd as a JSON-serialised command
+// recipe; startServer() honours it when present.
+// ---------------------------------------------------------------
+const ForgeAPI = {
+    metaUrl: 'https://maven.minecraftforge.net/net/minecraftforge/forge/maven-metadata.xml',
+    promoUrl: 'https://files.minecraftforge.net/net/minecraftforge/forge/promotions_slim.json',
+
+    _cache: null,
+    _cacheAt: 0,
+
+    /** Returns a map { '<mcVersion>': '<forgeBuild>', ... } using the promotions API. */
+    async getRecommendedBuilds() {
+        if (this._cache && Date.now() - this._cacheAt < 60_000) return this._cache;
+        const { statusCode, body } = await request(this.promoUrl, {
+            headers: { 'User-Agent': ENV.PAPER_UA, Accept: 'application/json' },
+            headersTimeout: 8000,
+            bodyTimeout: 8000,
+            maxRedirections: 5,
+        });
+        if (statusCode !== 200) {
+            body.dump?.();
+            throw new Error(`Forge promotions API ${statusCode}`);
+        }
+        const data = await body.json();
+        // promos keys look like '1.20.1-recommended', '1.20.1-latest'
+        const result = {};
+        for (const [key, build] of Object.entries(data.promos || {})) {
+            const m = key.match(/^(.+?)-(recommended|latest)$/);
+            if (!m) continue;
+            const mc = m[1];
+            const tag = m[2];
+            // Prefer recommended over latest
+            if (!result[mc] || tag === 'recommended') result[mc] = String(build);
+        }
+        this._cache = result;
+        this._cacheAt = Date.now();
+        return result;
+    },
+
+    async listVersions() {
+        const builds = await this.getRecommendedBuilds();
+        // Sort by semver descending (1.21 > 1.20.4 > 1.20.1 > …)
+        const versions = Object.keys(builds).sort((a, b) => {
+            const pa = a.split('.').map(Number);
+            const pb = b.split('.').map(Number);
+            for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+                const x = pa[i] || 0, y = pb[i] || 0;
+                if (x !== y) return y - x;
+            }
+            return 0;
+        });
+        return versions;
+    },
+
+    async getInstallerDownload(mcVersion) {
+        const builds = await this.getRecommendedBuilds();
+        const build = builds[mcVersion];
+        if (!build) throw new Error(`Нет сборки Forge для ${mcVersion}`);
+        const fullVer = `${mcVersion}-${build}`;
+        const url = `https://maven.minecraftforge.net/net/minecraftforge/forge/${fullVer}/forge-${fullVer}-installer.jar`;
+        return { url, filename: `forge-${fullVer}-installer.jar`, fullVer, mcVersion, build };
     },
 };
 
 async function getServerVersions(flavor) {
-    if (flavor === 'paper') return await PaperAPI.listVersions('paper');
-    return GetBukkitAPI.list();
+    if (flavor === 'paper')  return await PaperAPI.listVersions('paper');
+    if (flavor === 'forge')  return await ForgeAPI.listVersions();
+    return SpigotBukkitMirror.list();
 }
 async function resolveServerDownload(flavor, version) {
     if (flavor === 'paper') return await PaperAPI.getDownload('paper', version);
-    return GetBukkitAPI.getDownload(flavor, version);
+    if (flavor === 'forge') return await ForgeAPI.getInstallerDownload(version);
+    return await SpigotBukkitMirror.getDownload(flavor, version);
 }
 
 // =====================================================================
@@ -568,10 +804,11 @@ function isPathInside(parent, child) {
 // =====================================================================
 
 const ServersRepo = {
-    create({ ownerId, name, flavor, mcVersion, dir, jar }) {
+    create({ ownerId, name, flavor, mcVersion, dir, jar, port = 25565, slots = 20, motd = '', startCmd = null }) {
         const info = db.prepare(
-            `INSERT INTO servers(owner_id, name, flavor, mc_version, dir, jar) VALUES (?,?,?,?,?,?)`
-        ).run(ownerId, name, flavor, mcVersion, dir, jar);
+            `INSERT INTO servers(owner_id, name, flavor, mc_version, dir, jar, port, slots, motd, start_cmd)
+             VALUES (?,?,?,?,?,?,?,?,?,?)`
+        ).run(ownerId, name, flavor, mcVersion, dir, jar, port, slots, motd, startCmd);
         return this.byId(info.lastInsertRowid);
     },
     byId(id) { return db.prepare(`SELECT * FROM servers WHERE id = ?`).get(id); },
@@ -580,7 +817,33 @@ const ServersRepo = {
     },
     listAll() { return db.prepare(`SELECT * FROM servers ORDER BY id DESC`).all(); },
     delete(id) { return db.prepare(`DELETE FROM servers WHERE id = ?`).run(id).changes; },
+    setPort(id, port) {
+        db.prepare(`UPDATE servers SET port = ? WHERE id = ?`).run(port, id);
+    },
 };
+
+/**
+ * Recursively look for a file matching `pattern` inside `root`, up to `depth`
+ * directory levels. Returns the absolute path of the first match, or null.
+ * Used after the Forge installer finishes to find unix_args.txt.
+ */
+async function findFile(root, pattern, depth = 4) {
+    if (depth < 0) return null;
+    let entries;
+    try { entries = await fsp.readdir(root, { withFileTypes: true }); }
+    catch { return null; }
+    // BFS: files first, then subdirs
+    for (const e of entries) {
+        if (e.isFile() && pattern.test(e.name)) return path.join(root, e.name);
+    }
+    for (const e of entries) {
+        if (e.isDirectory()) {
+            const sub = await findFile(path.join(root, e.name), pattern, depth - 1);
+            if (sub) return sub;
+        }
+    }
+    return null;
+}
 
 // =====================================================================
 // 7. RUNTIME REGISTRY (in-memory: live processes)
@@ -631,14 +894,42 @@ async function startServer(server, ctx) {
 
     await fsp.writeFile(path.join(server.dir, 'eula.txt'), 'eula=true\n');
 
-    const args = [
-        `-Xms${ENV.JVM_XMS}`,
-        `-Xmx${ENV.JVM_XMX}`,
-        '-XX:+UseG1GC',
-        '-jar', server.jar,
-        'nogui',
-    ];
-    log.info(`Starting server #${server.id} (${server.flavor} ${server.mc_version}) in ${server.dir} via ${ENV.JAVA_BIN}`);
+    // Build command line. Forge (modern) uses an args file (`@unix_args.txt`),
+    // everything else uses `-jar <server.jar>`.
+    let args;
+    let recipe = null;
+    try { recipe = server.start_cmd ? JSON.parse(server.start_cmd) : null; } catch { recipe = null; }
+
+    if (recipe && recipe.mode === 'forge-args' && recipe.argsFile) {
+        const argsPath = path.join(server.dir, recipe.argsFile);
+        if (!fs.existsSync(argsPath)) {
+            await ctx.reply(
+                `❌ Не найдён файл запуска Forge: <code>${esc(recipe.argsFile)}</code>\n` +
+                `Попробуйте переустановить сервер.`,
+                { parse_mode: 'HTML' }
+            ).catch(() => {});
+            return;
+        }
+        args = [
+            `-Xms${ENV.JVM_XMS}`,
+            `-Xmx${ENV.JVM_XMX}`,
+            '-XX:+UseG1GC',
+            `@${recipe.argsFile}`,
+            'nogui',
+        ];
+    } else {
+        const jarRel = recipe?.mode === 'jar' && recipe.jar
+            ? recipe.jar
+            : path.relative(server.dir, server.jar) || server.jar;
+        args = [
+            `-Xms${ENV.JVM_XMS}`,
+            `-Xmx${ENV.JVM_XMX}`,
+            '-XX:+UseG1GC',
+            '-jar', jarRel,
+            'nogui',
+        ];
+    }
+    log.info(`Starting server #${server.id} (${server.flavor} ${server.mc_version}) in ${server.dir} via ${ENV.JAVA_BIN}: ${args.join(' ')}`);
 
     let child;
     try {
@@ -666,20 +957,70 @@ async function startServer(server, ctx) {
     };
     RUNNING.set(server.id, state);
 
+    // Console live-refresh: when a console message is open, debounce-update
+    // the SAME message every ~1.2s so users see output appear in place.
+    let consoleRefreshTimer = null;
+    const scheduleConsoleRefresh = () => {
+        if (!state.consoleMsg) return;
+        if (consoleRefreshTimer) return;
+        consoleRefreshTimer = setTimeout(() => {
+            consoleRefreshTimer = null;
+            // Best-effort — ignore failures (message deleted / not modified)
+            refreshConsoleMessage(ctx, server, state, null).catch(() => {});
+        }, 1200);
+    };
+
     const collect = (chunk) => {
         const text = chunk.toString('utf8');
         state.log.push(text);
         if (state.log.length > 500) state.log.shift();
+        scheduleConsoleRefresh();
         if (!state.bootDone) {
             state.bootLogForAI += text;
             if (state.bootLogForAI.length > 8000) state.bootLogForAI = state.bootLogForAI.slice(-8000);
             if (/Done \([\d.]+s\)!/.test(text) || /For help, type/.test(text)) {
                 state.bootDone = true;
-                ctx.telegram.sendMessage(
-                    state.chatId,
-                    `✅ Сервер «<b>${esc(server.name)}</b>» успешно запустился.`,
-                    { parse_mode: 'HTML' }
-                ).catch(() => {});
+                // Announce success + IP:port + full status (player count via SLP)
+                (async () => {
+                    const port = readServerPort(server.dir, server.port || 25565);
+                    const ip = await getPublicIp().catch(() => null);
+                    // Give the server a beat to bind the port before pinging.
+                    await new Promise((r) => setTimeout(r, 1500));
+                    const status = await queryMinecraftStatus('127.0.0.1', port).catch(() => null);
+
+                    const uptime = Math.round((Date.now() - state.startedAt) / 1000);
+                    const connStr = ip ? `${ip}:${port}` : `??:${port}`;
+                    let playersLine = '';
+                    let motdLine = '';
+                    let verLine  = '';
+                    if (status) {
+                        const online = status.players?.online ?? '?';
+                        const max    = status.players?.max ?? server.slots ?? '?';
+                        playersLine = `\n👥 Онлайн: <b>${esc(online)}</b>/<b>${esc(max)}</b>`;
+                        const motd = motdToString(status.description);
+                        if (motd) motdLine = `\n📝 MOTD: <code>${esc(motd.slice(0, 100))}</code>`;
+                        if (status.version?.name) verLine = `\n⛙️ Версия игры: <code>${esc(status.version.name)}</code>`;
+                    }
+
+                    ctx.telegram.sendMessage(
+                        state.chatId,
+                        `<tg-emoji emoji-id="5870633910337015697">✅</tg-emoji> Сервер «<b>${esc(server.name)}</b>» запущен!\n\n` +
+                        `📍 Адрес: <code>${esc(connStr)}</code>\n` +
+                        `⚙️ Сборка: ${esc(server.flavor)} ${esc(server.mc_version)}` +
+                        verLine +
+                        playersLine +
+                        motdLine +
+                        `\n⏱ Время старта: <b>${uptime}с</b>`,
+                        {
+                            parse_mode: 'HTML',
+                            ...Markup.inlineKeyboard([
+                                [Markup.button.callback('🖥 Консоль',     `srv:console:${server.id}`)],
+                                [Markup.button.callback('📊 Статус',    `srv:status:${server.id}`)],
+                                [Markup.button.callback('⬅️ К серверу', `srv:open:${server.id}`)],
+                            ]),
+                        }
+                    ).catch(() => {});
+                })();
             }
         }
     };
@@ -763,17 +1104,327 @@ function stopServer(serverId) {
 }
 
 // =====================================================================
-// 8. AI HELPERS  (startup analysis + file placement)
+// 7b. IP / PORT UTILITIES
 // =====================================================================
+
+// Cache the public IP for 10 minutes — it almost never changes on a host
+// and the auto-info banner uses it on every server-status refresh.
+let _publicIpCache = { ip: null, at: 0 };
+
+/**
+ * Fetch the public IP of the host. Strategy (with fallbacks):
+ *   0) ENV.PUBLIC_IP — forced override for VPS behind NAT / Docker
+ *   1) cached value, if fresh
+ *   2) parallel race against several public lookup services
+ *   3) DNS-based services (myip.opendns.com via resolver4)
+ *   4) hostname → IP local fallback (last resort — may return a LAN IP)
+ */
+async function getPublicIp() {
+    if (ENV.PUBLIC_IP && /^\d{1,3}(\.\d{1,3}){3}$/.test(ENV.PUBLIC_IP)) {
+        return ENV.PUBLIC_IP;
+    }
+    if (_publicIpCache.ip && Date.now() - _publicIpCache.at < 600_000) {
+        return _publicIpCache.ip;
+    }
+
+    const httpServices = [
+        'https://api.ipify.org',
+        'https://ipv4.icanhazip.com',
+        'https://checkip.amazonaws.com',
+        'https://api.seeip.org',
+        'https://ifconfig.me/ip',
+        'https://ipinfo.io/ip',
+    ];
+
+    const probeHttp = (url) => (async () => {
+        const { statusCode, body } = await request(url, {
+            headers: { 'User-Agent': ENV.PAPER_UA, Accept: 'text/plain' },
+            headersTimeout: 4500,
+            bodyTimeout: 4500,
+            maxRedirections: 3,
+        });
+        if (statusCode !== 200) { body.dump?.(); throw new Error('status ' + statusCode); }
+        const txt = (await body.text()).trim();
+        if (!/^\d{1,3}(\.\d{1,3}){3}$/.test(txt)) throw new Error('not an ipv4');
+        return txt;
+    })();
+
+    // Race — first successful response wins.
+    try {
+        const ip = await Promise.any(httpServices.map(probeHttp));
+        _publicIpCache = { ip, at: Date.now() };
+        return ip;
+    } catch { /* all failed, try DNS-based */ }
+
+    // DNS fallback: OpenDNS "myip.opendns.com" returns the caller's IP
+    try {
+        const Resolver = require('dns').promises.Resolver;
+        const r = new Resolver();
+        r.setServers(['208.67.222.222', '208.67.220.220']);
+        const ips = await r.resolve4('myip.opendns.com');
+        const ip = ips[0];
+        if (/^\d{1,3}(\.\d{1,3}){3}$/.test(ip)) {
+            _publicIpCache = { ip, at: Date.now() };
+            return ip;
+        }
+    } catch { /* ignore */ }
+
+    // Last resort: local hostname → IP (may be 127.0.0.1 or LAN)
+    try {
+        const nets = os.networkInterfaces();
+        for (const list of Object.values(nets)) {
+            for (const n of list || []) {
+                if (n.family === 'IPv4' && !n.internal && !n.address.startsWith('169.254.')) {
+                    return n.address;
+                }
+            }
+        }
+    } catch { /* ignore */ }
+
+    return null;
+}
+
+// =====================================================================
+// 7b.1 AUTO-PORT ALLOCATOR
+// =====================================================================
+// Each user / server gets its own random free port from [PORT_RANGE_MIN,
+// PORT_RANGE_MAX]. This prevents two servers (possibly from different
+// users) from binding the same port and silently failing to start.
+//
+// Algorithm:
+//   1) Collect all ports already used by other servers in the DB.
+//   2) Pick a random candidate not in that set.
+//   3) Verify the OS can bind the port (handles ports taken by other
+//      processes on the host).
+//   4) Retry up to 80 times; then sequentially scan the range.
+// =====================================================================
+function _isPortFree(port, host = '0.0.0.0') {
+    return new Promise((resolve) => {
+        const tester = net.createServer()
+            .once('error', () => resolve(false))
+            .once('listening', () => tester.close(() => resolve(true)))
+            .listen(port, host);
+    });
+}
+
+/** Returns set of ports recorded in DB across all servers. */
+function _usedPortsFromDb() {
+    const rows = db.prepare(`SELECT port FROM servers`).all();
+    return new Set(rows.map((r) => Number(r.port)).filter(Boolean));
+}
+
+/**
+ * Allocate a free port within [min, max]. Excludes ports already used by
+ * other servers (in DB) and ports currently bound on the host.
+ */
+async function allocateFreePort(min = ENV.PORT_RANGE_MIN, max = ENV.PORT_RANGE_MAX) {
+    const used = _usedPortsFromDb();
+    const tried = new Set();
+
+    // Random attempts first — fast for sparse ranges.
+    for (let i = 0; i < 80; i++) {
+        const p = Math.floor(Math.random() * (max - min + 1)) + min;
+        if (used.has(p) || tried.has(p)) continue;
+        tried.add(p);
+        if (await _isPortFree(p)) return p;
+    }
+    // Sequential scan fallback.
+    for (let p = min; p <= max; p++) {
+        if (used.has(p) || tried.has(p)) continue;
+        if (await _isPortFree(p)) return p;
+    }
+    throw new Error(`Все порты в диапазоне ${min}-${max} заняты.`);
+}
+
+// =====================================================================
+// 7b.2 MINECRAFT SERVER STATUS QUERY (SLP — Server List Ping)
+// =====================================================================
+// Implements the modern (1.7+) Server List Ping protocol so we can
+// display online players, MOTD, MC version *as the game sees them*
+// without parsing logs. We use a 4-second timeout and never throw —
+// failures resolve to null so the UI just hides the section.
+// =====================================================================
+function _writeVarInt(value) {
+    const bytes = [];
+    let v = value >>> 0;
+    while (true) {
+        if ((v & ~0x7f) === 0) { bytes.push(v); break; }
+        bytes.push((v & 0x7f) | 0x80);
+        v >>>= 7;
+    }
+    return Buffer.from(bytes);
+}
+function _readVarIntFromBuffer(buf, offset) {
+    let value = 0, length = 0, currentByte;
+    while (true) {
+        if (offset + length >= buf.length) return null;
+        currentByte = buf[offset + length];
+        value |= (currentByte & 0x7f) << (length * 7);
+        length++;
+        if ((currentByte & 0x80) === 0) break;
+        if (length > 5) return null;
+    }
+    return { value, length };
+}
+
+async function queryMinecraftStatus(host, port, timeoutMs = 4000) {
+    return new Promise((resolve) => {
+        const sock = net.createConnection({ host, port });
+        let buf = Buffer.alloc(0);
+        let settled = false;
+        const done = (val) => { if (settled) return; settled = true; try { sock.destroy(); } catch {} resolve(val); };
+
+        const timer = setTimeout(() => done(null), timeoutMs);
+
+        sock.once('connect', () => {
+            // Handshake (protocol -1 → fall back to latest on server side)
+            const hostBuf = Buffer.from(host, 'utf8');
+            const hs = Buffer.concat([
+                Buffer.from([0x00]),              // packet id
+                _writeVarInt(-1 >>> 0),           // protocol version (unknown)
+                _writeVarInt(hostBuf.length),
+                hostBuf,
+                Buffer.from([(port >> 8) & 0xff, port & 0xff]), // unsigned short
+                _writeVarInt(1),                  // next state = status
+            ]);
+            const hsPacket = Buffer.concat([_writeVarInt(hs.length), hs]);
+            sock.write(hsPacket);
+            // Status request
+            const sr = Buffer.from([0x00]);
+            const srPacket = Buffer.concat([_writeVarInt(sr.length), sr]);
+            sock.write(srPacket);
+        });
+
+        sock.on('data', (chunk) => {
+            buf = Buffer.concat([buf, chunk]);
+            // Try to parse: VarInt(length) + VarInt(packet id 0x00) + VarInt(strLen) + str
+            const lenInfo = _readVarIntFromBuffer(buf, 0);
+            if (!lenInfo) return;
+            if (buf.length < lenInfo.length + lenInfo.value) return;
+
+            const pidInfo = _readVarIntFromBuffer(buf, lenInfo.length);
+            if (!pidInfo) return done(null);
+            if (pidInfo.value !== 0x00) return done(null);
+
+            const strLenInfo = _readVarIntFromBuffer(buf, lenInfo.length + pidInfo.length);
+            if (!strLenInfo) return done(null);
+            const strStart = lenInfo.length + pidInfo.length + strLenInfo.length;
+            const strEnd = strStart + strLenInfo.value;
+            if (buf.length < strEnd) return;
+            const json = buf.slice(strStart, strEnd).toString('utf8');
+            try {
+                const obj = JSON.parse(json);
+                clearTimeout(timer);
+                done(obj);
+            } catch { done(null); }
+        });
+
+        sock.on('error', () => done(null));
+        sock.on('close', () => done(null));
+    });
+}
+
+/** Flatten a Minecraft chat-component MOTD into plain text. */
+function motdToString(motd) {
+    if (motd === null || motd === undefined) return '';
+    if (typeof motd === 'string') return motd.replace(/§[0-9a-frk-o]/gi, '').trim();
+    let s = '';
+    if (typeof motd.text === 'string') s += motd.text;
+    if (Array.isArray(motd.extra)) for (const e of motd.extra) s += motdToString(e);
+    return s.replace(/§[0-9a-frk-o]/gi, '').trim();
+}
+
+/**
+ * Read the `server-port` value from server.properties (if file exists).
+ * Falls back to the DB port value, then 25565.
+ */
+function readServerPort(serverDir, dbPort = 25565) {
+    try {
+        const propsPath = path.join(serverDir, 'server.properties');
+        const content = fs.readFileSync(propsPath, 'utf8');
+        const m = content.match(/^server-port\s*=\s*(\d+)/m);
+        if (m) return Number(m[1]);
+    } catch { /* file not created yet */ }
+    return dbPort;
+}
+
+/**
+ * Write/update a key in server.properties.
+ * Creates the file if missing, updates the line if present, appends if absent.
+ */
+async function writeServerProperty(serverDir, key, value) {
+    const propsPath = path.join(serverDir, 'server.properties');
+    let content = '';
+    try { content = await fsp.readFile(propsPath, 'utf8'); } catch { /* new file */ }
+    const regex = new RegExp(`^(${key}\\s*=).*`, 'm');
+    if (regex.test(content)) {
+        content = content.replace(regex, `$1${value}`);
+    } else {
+        content += (content.endsWith('\n') || !content ? '' : '\n') + `${key}=${value}\n`;
+    }
+    await fsp.writeFile(propsPath, content, 'utf8');
+}
+
+// =====================================================================
+// 7c. FILE MANAGER (browse/read/delete inside server dir, never above /app)
+// =====================================================================
+
+const APP_ROOT = path.resolve('/app');
+
+/** Resolve a relative path inside server.dir; throw if it escapes app root or server dir. */
+function resolveServerPath(server, relPath) {
+    const base = path.resolve(server.dir);
+    const resolved = relPath ? path.resolve(base, relPath) : base;
+    // Must stay inside /app (Docker root) — double safety
+    if (!resolved.startsWith(APP_ROOT + path.sep) && resolved !== APP_ROOT) {
+        throw new Error('Путь выходит за пределы /app');
+    }
+    // Must stay inside server dir
+    if (!resolved.startsWith(base + path.sep) && resolved !== base) {
+        throw new Error('Путь выходит за пределы директории сервера');
+    }
+    return resolved;
+}
+
+/** List directory entries with type tags. Returns max 40 entries. */
+async function listDir(absPath) {
+    const entries = await fsp.readdir(absPath, { withFileTypes: true });
+    return entries.slice(0, 60).map((e) => ({
+        name: e.name,
+        isDir: e.isDirectory(),
+        isFile: e.isFile(),
+    }));
+}
+
+/** Read a text file, capped at 8 KB for Telegram messages. */
+async function readTextFile(absPath, maxBytes = 8000) {
+    const stat = await fsp.stat(absPath);
+    if (stat.size > 1024 * 1024) throw new Error('Файл слишком большой (> 1 МБ)');
+    const buf = Buffer.alloc(Math.min(stat.size, maxBytes));
+    const fd = await fsp.open(absPath, 'r');
+    try {
+        await fd.read(buf, 0, buf.length, 0);
+    } finally {
+        await fd.close();
+    }
+    return { text: buf.toString('utf8'), truncated: stat.size > maxBytes, size: stat.size };
+}
+
+
 
 async function aiAnalyseStartup(logText, server) {
     const system = `Ты — эксперт по администрированию Minecraft-серверов
-(Paper/Spigot/Bukkit). Тебе дают хвост лога старта сервера.
+(Paper/Spigot/Bukkit/Forge). Тебе дают хвост лога старта сервера.
 Кратко (5–10 строк, на русском) ответь:
 1) Запустился ли сервер корректно (Да / Нет / Частично).
 2) Если есть ошибки — какие и как их исправить.
 3) Дай 1–2 совета по оптимизации, если уместно.
-Не выдумывай факты, опирайся только на лог.`;
+Не выдумывай факты, опирайся только на лог.
+
+ВАЖНО: пиши ОБЫЧНЫМ ТЕКСТОМ, без какого-либо форматирования.
+НЕ используй Markdown (**жирный**, *курсив*, \`код\`, # заголовки, списки с -/* ),
+НЕ используй HTML-теги (<b>, <i>, <code>, <pre>, …).
+Только чистый текст. Эмодзи допустимы.`;
     const user = `Сервер: ${server.flavor} ${server.mc_version}, директория ${server.dir}\n\n=== ЛОГ ===\n${logText}`;
     return await aiChat({ system, user, maxTokens: 600 });
 }
@@ -783,6 +1434,9 @@ async function aiPlanFilePlacement({ filename, kind, server, listing }) {
 (${server.flavor} ${server.mc_version}).
 Дано имя файла, его тип и (для архивов) список вложенных файлов.
 Реши, КУДА положить файл или его содержимое внутри директории сервера.
+
+ВАЖНО: в поле "reason" пиши ОБЫЧНЫМ ТЕКСТОМ без Markdown/HTML
+(никаких **звёздочек**, \`бэктиков\`, <тегов>). Только чистый текст.
 
 Стандартные подкаталоги:
   - plugins/      → плагины (.jar) для Bukkit/Spigot/Paper
@@ -862,6 +1516,10 @@ async function aiGeneratePluginOrScript({ prompt, server }) {
 `Ты — старший разработчик Minecraft (Bukkit/Spigot/Paper) и эксперт по Skript.
 Твоя задача — по промту пользователя написать ОДИН файл: либо Skript-скрипт (.sk),
 либо полную исходнику Bukkit/Spigot/Paper-плагина, либо .mcfunction.
+
+ВАЖНО про поле "summary": пиши ОБЫЧНЫМ ТЕКСТОМ, без Markdown и HTML
+(никаких **bold**, *italic*, \`code\`, # заголовков, тегов <b>/<code>).
+Содержимое файлов (поле content) — конечно, код, без ограничений.
 
 Правила:
 • Если в списке плагинов есть Skript — предпочитай type="skript" (проще в установке).
@@ -1107,7 +1765,9 @@ function mainMenuText(ctx) {
     return (
         `<tg-emoji emoji-id="5870764288364252592">🙂</tg-emoji> Привет, <b>${esc(ctx.from.first_name || 'пользователь')}</b>!\n\n` +
         `Я помогу установить и запустить Minecraft-сервер ` +
-        `(Bukkit / Spigot / Paper) и интегрирую AI-помощника от OnlySQ.\n\n` +
+        `(Bukkit / Spigot / Paper / Forge) и интегрирую AI-помощника от OnlySQ.\n\n` +
+        `Порт выдаётся автоматически из диапазона ` +
+        `<code>${ENV.PORT_RANGE_MIN}–${ENV.PORT_RANGE_MAX}</code> — порты не пересекаются.\n\n` +
         `Выберите действие:`
     );
 }
@@ -1153,6 +1813,7 @@ bot.action('menu:main', async (ctx) => {
     ctx.session.adminWait = null;
     ctx.session.uploadWait = null;
     ctx.session.aigenWait = null;
+    ctx.session.consoleFor = null;
     return safeEdit(ctx, mainMenuText(ctx), mainMenuKeyboard(ctx));
 });
 
@@ -1166,12 +1827,13 @@ bot.action('srv:new', async (ctx) => {
             [Markup.button.callback('Paper (рекомендуется)', 'new:flavor:paper')],
             [Markup.button.callback('Spigot', 'new:flavor:spigot')],
             [Markup.button.callback('Bukkit', 'new:flavor:bukkit')],
+            [Markup.button.callback('Forge (моды)', 'new:flavor:forge')],
             [Markup.button.callback('⬅️ В меню', 'menu:main')],
         ])
     );
 });
 
-bot.action(/^new:flavor:(paper|spigot|bukkit)$/, async (ctx) => {
+bot.action(/^new:flavor:(paper|spigot|bukkit|forge)$/, async (ctx) => {
     await ctx.answerCbQuery().catch(() => {});
     const flavor = ctx.match[1];
     ctx.session.wizard = { step: 'version', flavor };
@@ -1243,15 +1905,52 @@ bot.action(/^new:ver:(.+)$/, async (ctx) => {
         `Версия: <b>${esc(version)}</b>.\n` +
         `Введите имя для нового сервера ` +
         `(латиница, цифры, точка, тире, подчёркивание; 2–40 символов).\n\n` +
+        `Это имя будет видно в боте; далее спрошу слоты и MOTD.\n` +
         `Для отмены — /cancel`,
         Markup.inlineKeyboard([[Markup.button.callback('⬅️ Назад', `new:flavor:${ctx.session.wizard.flavor}`)]])
     );
 });
 
-// Text handler for wizard steps and admin steps
+// Text handler for wizard steps, admin steps, and live console.
 bot.on('text', async (ctx, next) => {
     const w = ctx.session.wizard;
     const a = ctx.session.adminWait;
+
+    // ----- Live console: every text becomes a server command -----
+    // Highest priority (above wizard/admin) so users in console mode
+    // never accidentally get their commands swallowed by another step.
+    const cs = ctx.session.consoleFor;
+    if (cs && (!w || w.step === 'done') && !a && !ctx.session.uploadWait && !ctx.session.aigenWait) {
+        const text = ctx.message.text.trim();
+        // Allow /exit (and /cancel) to leave console mode
+        if (/^\/(exit|stop_console|cancel)$/i.test(text)) {
+            ctx.session.consoleFor = null;
+            const st0 = RUNNING.get(cs.serverId);
+            if (st0) st0.consoleMsg = null;
+            try { await ctx.deleteMessage(); } catch {}
+            await ctx.reply('Консоль закрыта.').catch(() => {});
+            return;
+        }
+        const state = RUNNING.get(cs.serverId);
+        const server = ServersRepo.byId(cs.serverId);
+        if (!state) {
+            // Server stopped while user was typing.
+            ctx.session.consoleFor = null;
+            return ctx.reply('⚠️ Сервер больше не запущен.');
+        }
+        // Delete user's command message so the chat stays clean.
+        try { await ctx.deleteMessage(); } catch { /* old / no rights */ }
+        // Strip leading slash if user types Minecraft-style /tp ...
+        const cmd = text.replace(/^\//, '');
+        try { state.child.stdin.write(cmd + '\n'); }
+        catch (e) {
+            await ctx.reply('❌ Не удалось отправить команду: ' + e.message).catch(() => {});
+            return;
+        }
+        // Give the server a moment to react, then refresh the console view.
+        setTimeout(() => refreshConsoleMessage(ctx, server, state, cmd), 900);
+        return;
+    }
 
     // ----- Admin: waiting for username/id input -----
     if (a) {
@@ -1290,38 +1989,141 @@ bot.on('text', async (ctx, next) => {
         if (!/^[\w.-]{2,40}$/.test(name)) {
             return ctx.reply('❌ Имя должно быть 2–40 символов: буквы/цифры/._-');
         }
-        const dirName = `${ctx.from.id}_${safeName(name)}_${Date.now()}`;
+        w.name = name;
+        w.step = 'slots';
+        return ctx.reply(
+            `👥 Сколько слотов для игроков? Введите число от 1 до 500 (по умолчанию 20).\n` +
+            `Например: <code>20</code>\n\n` +
+            `Для отмены — /cancel`,
+            { parse_mode: 'HTML' }
+        );
+    }
+
+    // ----- Wizard: slots -----
+    if (w && w.step === 'slots') {
+        const raw = ctx.message.text.trim();
+        const n = Number(raw);
+        if (!Number.isInteger(n) || n < 1 || n > 500) {
+            return ctx.reply('❌ Слоты — целое число от 1 до 500. Попробуйте ещё раз.');
+        }
+        w.slots = n;
+        w.step = 'motd';
+        return ctx.reply(
+            `📝 Введите название (MOTD), которое будет видно в списке серверов Minecraft.\n` +
+            `Максимум 59 символов, можно с форматированием § (например <code>§aMy Server</code>).\n\n` +
+            `Отправьте «-» чтобы использовать имя сервера по умолчанию.\n` +
+            `Для отмены — /cancel`,
+            { parse_mode: 'HTML' }
+        );
+    }
+
+    // ----- Wizard: motd -> install -----
+    if (w && w.step === 'motd') {
+        let motd = ctx.message.text.trim();
+        if (motd === '-' || motd === '—') motd = w.name;
+        if (motd.length > 59) motd = motd.slice(0, 59);
+        w.motd = motd;
+
+        const dirName = `${ctx.from.id}_${safeName(w.name)}_${Date.now()}`;
         const dir = path.join(ENV.SERVERS_ROOT, dirName);
         ensureDirSync(dir);
 
-        const dlMsg = await ctx.reply(`⬇️ Скачиваю <b>${esc(w.flavor)} ${esc(w.mcVersion)}</b>…`,
-            { parse_mode: 'HTML' });
+        // Allocate a free port BEFORE downloading — fail-fast if exhausted.
+        let port;
+        try {
+            port = await allocateFreePort();
+        } catch (e) {
+            await fsp.rm(dir, { recursive: true, force: true }).catch(() => {});
+            ctx.session.wizard = null;
+            return ctx.reply(`❌ Не удалось выделить порт: <code>${esc(e.message)}</code>`,
+                { parse_mode: 'HTML', ...mainMenuKeyboard(ctx) });
+        }
 
-        let jarPath;
+        const dlMsg = await ctx.reply(
+            `⬇️ Скачиваю <b>${esc(w.flavor)} ${esc(w.mcVersion)}</b>…\n` +
+            `Выделён порт: <code>${port}</code>`,
+            { parse_mode: 'HTML' }
+        );
+
+        let jarPath, startCmdRecipe = null;
         try {
             const dl = await resolveServerDownload(w.flavor, w.mcVersion);
-            jarPath = path.join(dir, safeName(dl.filename));
-            await downloadToFile(dl.url, jarPath);
+            const downloadPath = path.join(dir, safeName(dl.filename));
+            await downloadToFile(dl.url, downloadPath);
+
+            if (w.flavor === 'forge') {
+                // Run the Forge installer (--installServer) inside the new dir.
+                await ctx.telegram.editMessageText(
+                    ctx.chat.id, dlMsg.message_id, undefined,
+                    `⛙️ Устанавливаю Forge (может занять 1-2 минуты)…`,
+                    { parse_mode: 'HTML' }
+                ).catch(() => {});
+                if (!ENV.JAVA_AVAILABLE) throw new Error('Java не найдена — установка Forge невозможна.');
+                await runCmd(ENV.JAVA_BIN, ['-jar', downloadPath, '--installServer'], { cwd: dir });
+
+                // Locate launch entrypoint after install.
+                const entries = await fsp.readdir(dir);
+                // Modern (1.17+): unix_args.txt
+                const argsTxt = await findFile(dir, /unix_args\.txt$/i, 6);
+                if (argsTxt) {
+                    startCmdRecipe = { mode: 'forge-args', argsFile: path.relative(dir, argsTxt) };
+                    jarPath = path.relative(dir, argsTxt); // stored for reference
+                } else {
+                    // Older Forge: forge-*-universal.jar OR forge-*.jar (excluding installer)
+                    const candidates = entries.filter((f) =>
+                        /^forge-.+\.jar$/i.test(f) && !/installer/i.test(f)
+                    );
+                    if (!candidates.length) throw new Error('Не найдён запускной jar Forge после установки.');
+                    jarPath = path.join(dir, candidates[0]);
+                    startCmdRecipe = { mode: 'jar', jar: candidates[0] };
+                }
+            } else {
+                jarPath = downloadPath;
+                startCmdRecipe = { mode: 'jar', jar: path.basename(downloadPath) };
+            }
         } catch (e) {
             await fsp.rm(dir, { recursive: true, force: true }).catch(() => {});
             ctx.session.wizard = null;
             try { await ctx.telegram.deleteMessage(ctx.chat.id, dlMsg.message_id); } catch {}
-            return ctx.reply(`❌ Не удалось скачать: <code>${esc(e.message)}</code>`,
+            return ctx.reply(`❌ Не удалось скачать/установить: <code>${esc(briefHttpError(e.message))}</code>`,
                 { parse_mode: 'HTML', ...mainMenuKeyboard(ctx) });
         }
+
         const srv = ServersRepo.create({
             ownerId: ctx.from.id,
-            name,
+            name: w.name,
             flavor: w.flavor,
             mcVersion: w.mcVersion,
             dir,
             jar: jarPath,
+            port,
+            slots: w.slots,
+            motd: w.motd,
+            startCmd: JSON.stringify(startCmdRecipe),
         });
+
+        // Pre-populate server.properties with port / slots / motd + branding
+        // (footer is appended to motd; user can change later via file manager).
+        await writeServerProperty(dir, 'server-port',  port).catch(() => {});
+        await writeServerProperty(dir, 'query.port',   port).catch(() => {});
+        await writeServerProperty(dir, 'max-players',  w.slots).catch(() => {});
+        await writeServerProperty(dir, 'motd',         `${w.motd} §8— ${ENV.BRAND_MOTD}`).catch(() => {});
+        await writeServerProperty(dir, 'online-mode',  'true').catch(() => {});
+        await writeServerProperty(dir, 'enable-status','true').catch(() => {});
+
         ctx.session.wizard = null;
         try { await ctx.telegram.deleteMessage(ctx.chat.id, dlMsg.message_id); } catch {}
+
+        const ip = await getPublicIp().catch(() => null);
         await ctx.reply(
-            `<tg-emoji emoji-id="5870633910337015697">✅</tg-emoji> Сервер «<b>${esc(name)}</b>» (${esc(w.flavor)} ${esc(w.mcVersion)}) установлен.\n` +
-            `Папка: <code>${esc(dir)}</code>`,
+            `<tg-emoji emoji-id="5870633910337015697">✅</tg-emoji> Сервер «<b>${esc(w.name)}</b>» установлен.\n\n` +
+            `⚙️ Сборка: <b>${esc(w.flavor)} ${esc(w.mcVersion)}</b>\n` +
+            `📐 Слоты: <b>${w.slots}</b>\n` +
+            `📝 MOTD: <code>${esc(w.motd)}</code>\n` +
+            `🔌 Порт: <code>${port}</code>\n` +
+            `📍 Адрес: <code>${ip ? ip + ':' + port : '??:' + port}</code>\n` +
+            `📁 Папка: <code>${esc(dir)}</code>\n\n` +
+            `ℹ️ Дописка «${esc(ENV.BRAND_MOTD)}» добавлена в MOTD. Изменить можно в server.properties.`,
             {
                 parse_mode: 'HTML',
                 ...Markup.inlineKeyboard([
@@ -1392,19 +2194,42 @@ bot.action(/^srv:open:(\d+)$/, async (ctx) => {
             Markup.inlineKeyboard([[Markup.button.callback('⬅️ К списку', 'srv:list')]]));
     }
     const live = RUNNING.has(s.id);
+    const port = readServerPort(s.dir, s.port || 25565);
+    const ip   = await getPublicIp().catch(() => null);
+    const connStr = ip ? `${ip}:${port}` : `порт ${port}`;
+
+    // Live status (online players, MC version) — only when running.
+    let liveLine = '';
+    if (live) {
+        const st = await queryMinecraftStatus('127.0.0.1', port).catch(() => null);
+        if (st) {
+            const online = st.players?.online ?? '?';
+            const max    = st.players?.max ?? s.slots ?? '?';
+            liveLine = `\n👥 Онлайн: <b>${esc(online)}</b>/<b>${esc(max)}</b>`;
+            if (st.version?.name) liveLine += `\n⛙️ Протокол: <code>${esc(st.version.name)}</code>`;
+        }
+    }
+
     return safeEdit(ctx,
-        `📦 <b>${esc(s.name)}</b>\n` +
-        `Сборка: ${esc(s.flavor)} ${esc(s.mc_version)}\n` +
-        `Папка: <code>${esc(s.dir)}</code>\n` +
+        `<tg-emoji emoji-id="5884479287171485878">📦</tg-emoji> <b>${esc(s.name)}</b>\n` +
+        `<tg-emoji emoji-id="5870982283724328568">⚙️</tg-emoji> Сборка: ${esc(s.flavor)} ${esc(s.mc_version)}\n` +
+        `<tg-emoji emoji-id="6042011682497106307">📍</tg-emoji> Адрес: <code>${esc(connStr)}</code>\n` +
+        `📐 Слоты: <b>${esc(s.slots || 20)}</b>` +
+        (s.motd ? `\n📝 MOTD: <code>${esc(String(s.motd).slice(0, 60))}</code>` : '') +
+        liveLine + `\n` +
+        `<tg-emoji emoji-id="5870528606328852614">📁</tg-emoji> Папка: <code>${esc(s.dir)}</code>\n` +
         `Статус: ${live ? '🟢 запущен' : '⚪ остановлен'}`,
         Markup.inlineKeyboard([
             live
-                ? [Markup.button.callback('🛑 Остановить', `srv:stop:${s.id}`)]
-                : [Markup.button.callback('▶️ Запустить',  `srv:start:${s.id}`)],
-            [Markup.button.callback('📦 Загрузить файл',  `srv:upfor:${s.id}`)],
-            [Markup.button.callback('📜 Лог',             `srv:log:${s.id}`)],
-            [Markup.button.callback('🗑 Удалить',          `srv:delask:${s.id}`)],
-            [Markup.button.callback('⬅️ К списку',         'srv:list')],
+                ? [Markup.button.callback('🛑 Остановить',       `srv:stop:${s.id}`),
+                   Markup.button.callback('🖥 Консоль',           `srv:console:${s.id}`)]
+                : [Markup.button.callback('▶️ Запустить',         `srv:start:${s.id}`)],
+            [Markup.button.callback('📊 Статус / онлайн',      `srv:status:${s.id}`)],
+            [Markup.button.callback('📦 Загрузить файл',          `srv:upfor:${s.id}`)],
+            [Markup.button.callback('📁 Файловый менеджер',       `fm:browse:${s.id}:`)],
+            [Markup.button.callback('📜 Лог',                     `srv:log:${s.id}`)],
+            [Markup.button.callback('🗑 Удалить',                  `srv:delask:${s.id}`)],
+            [Markup.button.callback('⬅️ К списку',                 'srv:list')],
         ])
     );
 });
@@ -1448,6 +2273,303 @@ bot.action(/^srv:log:(\d+)$/, async (ctx) => {
     await ctx.reply(
         `<pre>${esc(tail || '(пусто)')}</pre>`,
         { parse_mode: 'HTML' }
+    );
+});
+
+// =====================================================================
+// LIVE CONSOLE (send commands + see output)
+// =====================================================================
+// UX:
+//   1) User taps «🖥 Консоль» — we send a fresh message and remember its id
+//      in `state.consoleMsg`. The bot listens for the next text message(s)
+//      and treats every plain text from this chat (until exit) as a console
+//      command.
+//   2) On each user command:
+//        • we DELETE the user message right away (clean chat)
+//        • write the command into the server's stdin
+//        • EDIT the console message with the new log tail (so we keep ONE
+//          rolling message, not a spam of replies)
+//   3) The 'log' button still works for the full historical log.
+// =====================================================================
+
+async function refreshConsoleMessage(ctx, server, state, sentCmd) {
+    if (!state || !state.consoleMsg) return;
+    const tail = tailString(state.log.join(''), 3200);
+    const head =
+        `<tg-emoji emoji-id="5870982283724328568">⚙️</tg-emoji> <b>Консоль «${esc(server.name)}»</b>` +
+        (sentCmd ? `\n➜ отправлено: <code>${esc(sentCmd)}</code>` : '') +
+        `\n<i>Отправьте любое сообщение — это будет командой серверу. /exit — выход.</i>\n\n` +
+        `<pre>${esc(tail || '(пусто)')}</pre>`;
+    try {
+        await ctx.telegram.editMessageText(
+            state.consoleMsg.chatId,
+            state.consoleMsg.messageId,
+            undefined,
+            head,
+            {
+                parse_mode: 'HTML',
+                ...Markup.inlineKeyboard([
+                    [Markup.button.callback('🔄 Обновить', `srv:console:${server.id}`),
+                     Markup.button.callback('❌ Выйти',     `srv:consoff:${server.id}`)],
+                    [Markup.button.callback('🛑 Остановить сервер', `srv:stop:${server.id}`)],
+                ]),
+            }
+        );
+    } catch (e) {
+        // Message too old / not modified — silently ignore.
+        if (!/message is not modified/i.test(e?.response?.description || e?.message || '')) {
+            log.debug('console edit failed:', e.message);
+        }
+    }
+}
+
+bot.action(/^srv:console:(\d+)$/, async (ctx) => {
+    await ctx.answerCbQuery().catch(() => {});
+    const id = Number(ctx.match[1]);
+    const s = ServersRepo.byId(id);
+    if (!s) return safeEdit(ctx, 'Сервер не найден.');
+    if (!isAdmin(ctx.from.id) && s.owner_id !== ctx.from.id)
+        return ctx.answerCbQuery('🚫 Это не ваш сервер.', { show_alert: true }).catch(() => {});
+    const state = RUNNING.get(id);
+    if (!state) {
+        return safeEdit(ctx,
+            '⚠️ Сервер не запущен. Сначала нажмите «▶️ Запустить».',
+            Markup.inlineKeyboard([
+                [Markup.button.callback('▶️ Запустить', `srv:start:${id}`)],
+                [Markup.button.callback('⬅️ К серверу', `srv:open:${id}`)],
+            ])
+        );
+    }
+    // Bind console session: every plain text from this chat becomes a command
+    ctx.session.consoleFor = { serverId: id, chatId: ctx.chat.id };
+    const tail = tailString(state.log.join(''), 3200);
+    const sent = await ctx.reply(
+        `<tg-emoji emoji-id="5870982283724328568">⚙️</tg-emoji> <b>Консоль «${esc(s.name)}»</b>\n` +
+        `<i>Отправьте любое сообщение — это будет командой серверу. /exit — выйти из консоли.</i>\n\n` +
+        `<pre>${esc(tail || '(пусто)')}</pre>`,
+        {
+            parse_mode: 'HTML',
+            ...Markup.inlineKeyboard([
+                [Markup.button.callback('🔄 Обновить', `srv:console:${id}`),
+                 Markup.button.callback('❌ Выйти',     `srv:consoff:${id}`)],
+                [Markup.button.callback('🛑 Остановить сервер', `srv:stop:${id}`)],
+            ]),
+        }
+    );
+    state.consoleMsg = { chatId: ctx.chat.id, messageId: sent.message_id };
+});
+
+bot.action(/^srv:consoff:(\d+)$/, async (ctx) => {
+    await ctx.answerCbQuery('Консоль закрыта').catch(() => {});
+    ctx.session.consoleFor = null;
+    const id = Number(ctx.match[1]);
+    const st = RUNNING.get(id);
+    if (st) st.consoleMsg = null;
+    const s = ServersRepo.byId(id);
+    return safeEdit(ctx,
+        `Консоль закрыта.`,
+        Markup.inlineKeyboard([[Markup.button.callback('⬅️ К серверу', `srv:open:${s?.id || id}`)]])
+    );
+});
+
+// =====================================================================
+// STATUS QUERY (online players, MOTD, version) via SLP
+// =====================================================================
+bot.action(/^srv:status:(\d+)$/, async (ctx) => {
+    await ctx.answerCbQuery().catch(() => {});
+    const id = Number(ctx.match[1]);
+    const s = ServersRepo.byId(id);
+    if (!s) return safeEdit(ctx, 'Сервер не найден.');
+    if (!isAdmin(ctx.from.id) && s.owner_id !== ctx.from.id)
+        return ctx.answerCbQuery('🚫 Это не ваш сервер.', { show_alert: true }).catch(() => {});
+    const live = RUNNING.has(id);
+    const port = readServerPort(s.dir, s.port || 25565);
+    const ip   = await getPublicIp().catch(() => null);
+
+    let body = `⛙️ <b>${esc(s.name)}</b> — ${esc(s.flavor)} ${esc(s.mc_version)}\n` +
+               `📍 <code>${esc(ip ? ip + ':' + port : '??:' + port)}</code>\n` +
+               `📐 Слоты: <b>${esc(s.slots || 20)}</b>\n` +
+               `Статус: ${live ? '🟢 запущен' : '⚪ остановлен'}`;
+
+    if (live) {
+        const st = await queryMinecraftStatus('127.0.0.1', port).catch(() => null);
+        if (st) {
+            const online = st.players?.online ?? '?';
+            const max    = st.players?.max ?? s.slots ?? '?';
+            const motd   = motdToString(st.description) || '';
+            const names  = (st.players?.sample || []).map((p) => p.name).filter(Boolean);
+            body += `\n👥 Онлайн: <b>${esc(online)}</b>/<b>${esc(max)}</b>`;
+            if (names.length) body += `\n📦 Игроки: ${names.map((n) => esc(n)).join(', ')}`;
+            if (motd) body += `\n📝 MOTD: <code>${esc(motd.slice(0, 80))}</code>`;
+            if (st.version?.name) body += `\n⛙️ Игровая версия: <code>${esc(st.version.name)}</code>`;
+        } else {
+            body += `\n<i>Сервер запущен, но пинг ещё не отвечает (подождите ~10 сек).</i>`;
+        }
+    }
+
+    return safeEdit(ctx, body,
+        Markup.inlineKeyboard([
+            [Markup.button.callback('🔄 Обновить', `srv:status:${id}`)],
+            [Markup.button.callback('⬅️ К серверу', `srv:open:${id}`)],
+        ])
+    );
+});
+
+// =====================================================================
+// FILE MANAGER
+// =====================================================================
+
+/** Encode a relative path for use in callback_data (base64url, max 32 chars displayed). */
+function encodeRelPath(rel) {
+    return Buffer.from(rel || '').toString('base64url');
+}
+function decodeRelPath(enc) {
+    try { return Buffer.from(enc || '', 'base64url').toString('utf8'); } catch { return ''; }
+}
+
+bot.action(/^fm:browse:(\d+):(.*)$/, async (ctx) => {
+    await ctx.answerCbQuery().catch(() => {});
+    const id      = Number(ctx.match[1]);
+    const relPath = decodeRelPath(ctx.match[2]);
+    const s = ServersRepo.byId(id);
+    if (!s) return safeEdit(ctx, 'Сервер не найден.');
+    if (!isAdmin(ctx.from.id) && s.owner_id !== ctx.from.id)
+        return ctx.answerCbQuery('🚫 Это не ваш сервер.', { show_alert: true }).catch(() => {});
+
+    let absPath;
+    try {
+        absPath = resolveServerPath(s, relPath);
+    } catch (e) {
+        return safeEdit(ctx, `<tg-emoji emoji-id="5870657884844462243">❌</tg-emoji> ${esc(e.message)}`,
+            Markup.inlineKeyboard([[Markup.button.callback('⬅️ К серверу', `srv:open:${id}`)]]));
+    }
+
+    let stat;
+    try { stat = await fsp.stat(absPath); } catch {
+        return safeEdit(ctx, 'Путь не найден.',
+            Markup.inlineKeyboard([[Markup.button.callback('⬅️ К серверу', `srv:open:${id}`)]]));
+    }
+
+    // If it's a text file — show content
+    if (stat.isFile()) {
+        const ext = path.extname(absPath).toLowerCase();
+        const textExts = ['.txt','.log','.yml','.yaml','.json','.properties','.cfg','.conf','.sk','.java','.toml','.xml','.sh','.md'];
+        if (textExts.includes(ext) || stat.size < 8000) {
+            try {
+                const { text, truncated, size } = await readTextFile(absPath);
+                const sizeStr = size > 1024 ? `${(size/1024).toFixed(1)} КБ` : `${size} Б`;
+                const parentRel = path.dirname(relPath);
+                await safeEdit(ctx,
+                    `<tg-emoji emoji-id="5870528606328852614">📁</tg-emoji> <b>${esc(path.basename(absPath))}</b> (${sizeStr})` +
+                    (truncated ? ' <i>[обрезан до 8 КБ]</i>' : '') +
+                    `\n<pre>${esc(text)}</pre>`,
+                    Markup.inlineKeyboard([
+                        [Markup.button.callback('🗑 Удалить файл', `fm:del:${id}:${encodeRelPath(relPath)}`)],
+                        [Markup.button.callback('⬅️ Назад', `fm:browse:${id}:${encodeRelPath(parentRel)}`)],
+                    ])
+                );
+                return;
+            } catch (e) {
+                // fall through to show as binary
+            }
+        }
+        // Non-text or read error
+        const parentRel = path.dirname(relPath);
+        return safeEdit(ctx,
+            `<tg-emoji emoji-id="5870528606328852614">📁</tg-emoji> <b>${esc(path.basename(absPath))}</b>\n` +
+            `<i>Бинарный файл или не удалось прочитать.</i>`,
+            Markup.inlineKeyboard([
+                [Markup.button.callback('🗑 Удалить файл', `fm:del:${id}:${encodeRelPath(relPath)}`)],
+                [Markup.button.callback('⬅️ Назад', `fm:browse:${id}:${encodeRelPath(parentRel)}`)],
+            ])
+        );
+    }
+
+    // It's a directory — list contents
+    let entries;
+    try {
+        entries = await listDir(absPath);
+    } catch (e) {
+        return safeEdit(ctx, `Ошибка чтения директории: ${esc(e.message)}`,
+            Markup.inlineKeyboard([[Markup.button.callback('⬅️ К серверу', `srv:open:${id}`)]]));
+    }
+
+    const rows = entries.map((e) => {
+        const childRel = relPath ? `${relPath}/${e.name}` : e.name;
+        const icon = e.isDir ? '📂' : '📄';
+        return [Markup.button.callback(`${icon} ${e.name}`, `fm:browse:${id}:${encodeRelPath(childRel)}`)];
+    });
+
+    // Back button
+    const isRoot = !relPath || relPath === '';
+    if (!isRoot) {
+        const parentRel = relPath.includes('/') ? relPath.split('/').slice(0, -1).join('/') : '';
+        rows.push([Markup.button.callback('⬅️ Вверх', `fm:browse:${id}:${encodeRelPath(parentRel)}`)]);
+    }
+    rows.push([Markup.button.callback('⬅️ К серверу', `srv:open:${id}`)]);
+
+    const title = relPath || '/';
+    return safeEdit(ctx,
+        `<tg-emoji emoji-id="5870528606328852614">📁</tg-emoji> <b>${esc(s.name)}</b> — <code>${esc(title)}</code>\n` +
+        `Файлов/папок: ${entries.length}` + (entries.length === 60 ? ' (показаны первые 60)' : ''),
+        Markup.inlineKeyboard(rows)
+    );
+});
+
+// Delete confirmation
+bot.action(/^fm:del:(\d+):(.+)$/, async (ctx) => {
+    await ctx.answerCbQuery().catch(() => {});
+    const id      = Number(ctx.match[1]);
+    const relPath = decodeRelPath(ctx.match[2]);
+    const s = ServersRepo.byId(id);
+    if (!s) return safeEdit(ctx, 'Сервер не найден.');
+    if (!isAdmin(ctx.from.id) && s.owner_id !== ctx.from.id)
+        return ctx.answerCbQuery('🚫 Это не ваш сервер.', { show_alert: true }).catch(() => {});
+
+    let absPath;
+    try { absPath = resolveServerPath(s, relPath); } catch (e) {
+        return safeEdit(ctx, `<tg-emoji emoji-id="5870657884844462243">❌</tg-emoji> ${esc(e.message)}`);
+    }
+
+    const parentRel = relPath.includes('/') ? relPath.split('/').slice(0, -1).join('/') : '';
+    return safeEdit(ctx,
+        `<tg-emoji emoji-id="5870875489362513438">🗑</tg-emoji> Удалить <code>${esc(relPath)}</code>?\n<i>Действие необратимо.</i>`,
+        Markup.inlineKeyboard([
+            [Markup.button.callback('🗑 Да, удалить', `fm:delok:${id}:${encodeRelPath(relPath)}`)],
+            [Markup.button.callback('⬅️ Отмена',       `fm:browse:${id}:${encodeRelPath(parentRel)}`)],
+        ])
+    );
+});
+
+bot.action(/^fm:delok:(\d+):(.+)$/, async (ctx) => {
+    await ctx.answerCbQuery().catch(() => {});
+    const id      = Number(ctx.match[1]);
+    const relPath = decodeRelPath(ctx.match[2]);
+    const s = ServersRepo.byId(id);
+    if (!s) return safeEdit(ctx, 'Сервер не найден.');
+    if (!isAdmin(ctx.from.id) && s.owner_id !== ctx.from.id)
+        return ctx.answerCbQuery('🚫 Это не ваш сервер.', { show_alert: true }).catch(() => {});
+
+    let absPath;
+    try { absPath = resolveServerPath(s, relPath); } catch (e) {
+        return safeEdit(ctx, `<tg-emoji emoji-id="5870657884844462243">❌</tg-emoji> ${esc(e.message)}`);
+    }
+
+    try {
+        const stat = await fsp.stat(absPath);
+        if (stat.isDirectory()) {
+            await fsp.rm(absPath, { recursive: true, force: true });
+        } else {
+            await fsp.unlink(absPath);
+        }
+    } catch (e) {
+        return safeEdit(ctx, `<tg-emoji emoji-id="5870657884844462243">❌</tg-emoji> Ошибка удаления: ${esc(e.message)}`);
+    }
+
+    const parentRel = relPath.includes('/') ? relPath.split('/').slice(0, -1).join('/') : '';
+    return safeEdit(ctx,
+        `<tg-emoji emoji-id="5870633910337015697">✅</tg-emoji> <code>${esc(relPath)}</code> удалён.`,
+        Markup.inlineKeyboard([[Markup.button.callback('📁 Вернуться', `fm:browse:${id}:${encodeRelPath(parentRel)}`)]])
     );
 });
 
@@ -1804,11 +2926,12 @@ async function handleIncomingFile(ctx, opts) {
 
 function adminPanelKeyboard() {
     return Markup.inlineKeyboard([
-        [Markup.button.callback('➕ Выдать доступ',  'adm:grant')],
-        [Markup.button.callback('➖ Отозвать доступ', 'adm:revoke')],
+        [Markup.button.callback('➕ Выдать доступ',     'adm:grant')],
+        [Markup.button.callback('➖ Отозвать доступ',   'adm:revoke')],
         [Markup.button.callback('👥 Список пользователей', 'adm:list')],
         [Markup.button.callback(`🧠 Модель AI (${getSetting('ai_model')})`, 'adm:model')],
-        [Markup.button.callback('⬅️ В меню', 'menu:main')],
+        [Markup.button.callback('🌐 Публичный IP',      'adm:ip')],
+        [Markup.button.callback('⬅️ В меню',            'menu:main')],
     ]);
 }
 
@@ -1863,6 +2986,24 @@ bot.action('adm:list', async (ctx) => {
     return safeEdit(ctx,
         `👥 <b>Пользователи с доступом:</b>\n${u}\n\n` +
         `<b>Ожидают подтверждения:</b>\n${p}`,
+        Markup.inlineKeyboard([[Markup.button.callback('⬅️ Назад', 'adm:open')]])
+    );
+});
+
+bot.action('adm:ip', async (ctx) => {
+    await ctx.answerCbQuery().catch(() => {});
+    if (!isAdmin(ctx.from.id)) return;
+    await safeEdit(ctx, '<tg-emoji emoji-id="6028435952299413210">ℹ</tg-emoji> Определяю публичный IP…');
+    const ip = await getPublicIp().catch(() => null);
+    const servers = ServersRepo.listAll();
+    const srvLines = servers.map((s) => {
+        const port = readServerPort(s.dir, s.port || 25565);
+        return `• <b>${esc(s.name)}</b>: <code>${ip ? ip + ':' + port : '??:' + port}</code>`;
+    }).join('\n') || '<i>Серверов нет</i>';
+
+    return safeEdit(ctx,
+        `<tg-emoji emoji-id="6042011682497106307">📍</tg-emoji> <b>Публичный IP:</b> <code>${ip ? esc(ip) : 'не определён'}</code>\n\n` +
+        `<b>Адреса серверов:</b>\n${srvLines}`,
         Markup.inlineKeyboard([[Markup.button.callback('⬅️ Назад', 'adm:open')]])
     );
 });
