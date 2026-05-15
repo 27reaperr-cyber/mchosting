@@ -63,13 +63,38 @@ const ENV = {
     PAPER_UA: process.env.PAPER_UA || 'mc-tg-bot/1.0.0 (+https://github.com/local)',
     // Auto-port allocation range. Each new server gets a random free port
     // from this range so multiple users never collide.
-    PORT_RANGE_MIN: Number(process.env.PORT_RANGE_MIN || 25600),
-    PORT_RANGE_MAX: Number(process.env.PORT_RANGE_MAX || 26600),
+    // ВНИМАНИЕ: эти порты теперь — ВНУТРЕННИЕ (за прокси). Игроки их
+    // не видят. Главное, чтобы они не конфликтовали и не пересекались с
+    // PROXY_PORT. Берём диапазон ВЫШЕ PROXY_PORT, чтобы пересечений не было.
+    PORT_RANGE_MIN: Number(process.env.PORT_RANGE_MIN || 25700),
+    PORT_RANGE_MAX: Number(process.env.PORT_RANGE_MAX || 26700),
     // Optional manual override for public IP — useful for VPS/NAT setups
     // where ipify et al. return the wrong address.
     PUBLIC_IP: process.env.PUBLIC_IP || '',
     // Branding string appended to default MOTD; user can edit later.
     BRAND_MOTD: process.env.BRAND_MOTD || 'made by @mchost_drbot',
+
+    // ──────────────────────────────────────────────────────────────────
+    // 🔀 ВСТРОЕННЫЙ MINECRAFT REVERSE-PROXY (handshake router)
+    // ──────────────────────────────────────────────────────────────────
+    // Хостинг блокирует все порты, кроме одного публичного. Поэтому ВСЕ
+    // Minecraft-сервера доступны игрокам по адресу:
+    //     <subdomain>.<PROXY_DOMAIN>:<PROXY_PORT>
+    // Например:  awesome.mchost.bothost.tech:25600
+    // Прокси читает hostname из handshake-пакета MC-протокола и роутит
+    // соединение на нужный локальный (127.0.0.1) порт.
+    //
+    // Требования к DNS:
+    //   *.mchost.bothost.tech  A  <IP хоста>
+    //   mchost.bothost.tech    A  <IP хоста>
+    PROXY_ENABLED: (process.env.PROXY_ENABLED || '1') !== '0',
+    PROXY_DOMAIN:  process.env.PROXY_DOMAIN  || 'mchost.bothost.tech',
+    PROXY_PORT:    Number(process.env.PROXY_PORT  || 25600),
+    PROXY_HOST:    process.env.PROXY_HOST    || '0.0.0.0',
+    // BIND_HOST для самих MC-серверов: когда прокси включён, серверы должны
+    // слушать ТОЛЬКО на 127.0.0.1 (наружу не торчат, всё идёт через прокси).
+    // Если пользователь хочет старое поведение — пусть выставит BIND_HOST=''.
+    BIND_HOST: process.env.BIND_HOST ?? '127.0.0.1',
 };
 
 (function validateEnv() {
@@ -884,9 +909,29 @@ for (const stmt of [
     `ALTER TABLE servers ADD COLUMN slots     INTEGER NOT NULL DEFAULT 20`,
     `ALTER TABLE servers ADD COLUMN motd      TEXT    NOT NULL DEFAULT ''`,
     `ALTER TABLE servers ADD COLUMN start_cmd TEXT`,
+    // subdomain — ключ для Minecraft-reverse-proxy. Игрок подключается к
+    // <subdomain>.<PROXY_DOMAIN>:<PROXY_PORT>, прокси читает это из handshake
+    // и маршрутизирует на 127.0.0.1:<port> конкретного сервера.
+    `ALTER TABLE servers ADD COLUMN subdomain TEXT`,
 ]) {
     try { db.exec(stmt); } catch { /* column already exists */ }
 }
+
+// Уникальный индекс по subdomain (с учётом пустых значений при миграции).
+// CREATE UNIQUE INDEX ... WHERE subdomain IS NOT NULL — partial unique index.
+try {
+    db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_servers_subdomain
+             ON servers(subdomain) WHERE subdomain IS NOT NULL`);
+} catch { /* old SQLite without partial indexes — пропускаем */ }
+
+// Бэкфил: всем старым серверам без subdomain выдаём `s<id>`.
+try {
+    const rows = db.prepare(`SELECT id FROM servers WHERE subdomain IS NULL OR subdomain = ''`).all();
+    const upd = db.prepare(`UPDATE servers SET subdomain = ? WHERE id = ?`);
+    for (const r of rows) {
+        upd.run('s' + r.id, r.id);
+    }
+} catch (e) { /* не критично */ }
 
 // Ensure admin from .env always has access
 db.prepare(
@@ -1369,14 +1414,25 @@ function isPathInside(parent, child) {
 // =====================================================================
 
 const ServersRepo = {
-    create({ ownerId, name, flavor, mcVersion, dir, jar, port = 25565, slots = 20, motd = '', startCmd = null }) {
+    create({ ownerId, name, flavor, mcVersion, dir, jar, port = 25565, slots = 20, motd = '', startCmd = null, subdomain = null }) {
         const info = db.prepare(
-            `INSERT INTO servers(owner_id, name, flavor, mc_version, dir, jar, port, slots, motd, start_cmd)
-             VALUES (?,?,?,?,?,?,?,?,?,?)`
-        ).run(ownerId, name, flavor, mcVersion, dir, jar, port, slots, motd, startCmd);
-        return this.byId(info.lastInsertRowid);
+            `INSERT INTO servers(owner_id, name, flavor, mc_version, dir, jar, port, slots, motd, start_cmd, subdomain)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?)`
+        ).run(ownerId, name, flavor, mcVersion, dir, jar, port, slots, motd, startCmd, subdomain);
+        const row = this.byId(info.lastInsertRowid);
+        // Если subdomain не был передан — автогенерируем `s<id>`.
+        if (!row.subdomain) {
+            const auto = 's' + row.id;
+            db.prepare(`UPDATE servers SET subdomain = ? WHERE id = ?`).run(auto, row.id);
+            row.subdomain = auto;
+        }
+        return row;
     },
     byId(id) { return db.prepare(`SELECT * FROM servers WHERE id = ?`).get(id); },
+    bySubdomain(sub) {
+        if (!sub) return null;
+        return db.prepare(`SELECT * FROM servers WHERE subdomain = ? COLLATE NOCASE`).get(String(sub).toLowerCase());
+    },
     listByOwner(ownerId) {
         return db.prepare(`SELECT * FROM servers WHERE owner_id = ? ORDER BY id DESC`).all(ownerId);
     },
@@ -1385,7 +1441,56 @@ const ServersRepo = {
     setPort(id, port) {
         db.prepare(`UPDATE servers SET port = ? WHERE id = ?`).run(port, id);
     },
+    setSubdomain(id, sub) {
+        db.prepare(`UPDATE servers SET subdomain = ? WHERE id = ?`).run(sub, id);
+    },
+    isSubdomainTaken(sub, exceptId = null) {
+        const r = db.prepare(
+            `SELECT id FROM servers WHERE subdomain = ? COLLATE NOCASE AND id != ?`
+        ).get(String(sub).toLowerCase(), exceptId || 0);
+        return !!r;
+    },
 };
+
+// ──────────────────────────────────────────────────────────────────
+// SUBDOMAIN хелперы
+// ──────────────────────────────────────────────────────────────────
+// Поддомены — аскии, 3..32, [a-z0-9-], не начинается и не заканчивается дефисом.
+function normalizeSubdomain(raw) {
+    if (!raw) return null;
+    let s = String(raw).toLowerCase().trim();
+    s = s.replace(/[^a-z0-9-]/g, '-');     // всё левое — в дефис
+    s = s.replace(/-+/g, '-');             // сливаем повторы
+    s = s.replace(/^-+|-+$/g, '');         // обрезаем края
+    if (s.length < 3 || s.length > 32) return null;
+    if (/^\d+$/.test(s)) return null;      // чистые цифры запрещаем (конфликт с IP)
+    return s;
+}
+
+// Подбор уникального subdomain'а по имени сервера + суффикс при коллизии.
+function allocateSubdomain(seed, ownerId) {
+    const base = normalizeSubdomain(seed) || ('srv' + Math.floor(Math.random() * 9000 + 1000));
+    let candidate = base;
+    let i = 0;
+    while (ServersRepo.isSubdomainTaken(candidate)) {
+        i++;
+        const suffix = '-' + (i < 30 ? i : Math.floor(Math.random() * 9000 + 1000));
+        candidate = (base + suffix).slice(0, 32).replace(/-+$/, '');
+        if (i > 200) {
+            candidate = ('srv' + Date.now().toString(36)).slice(0, 32);
+            break;
+        }
+    }
+    return candidate;
+}
+
+// Полный адрес для игрока: <sub>.<domain>:<port>
+function publicAddressForServer(server) {
+    if (!ENV.PROXY_ENABLED) return null;
+    if (!server || !server.subdomain) return null;
+    const portPart = (ENV.PROXY_PORT === 25565) ? '' : (':' + ENV.PROXY_PORT);
+    return `${server.subdomain}.${ENV.PROXY_DOMAIN}${portPart}`;
+}
 
 /**
  * Recursively look for a file matching `pattern` inside `root`, up to `depth`
@@ -1639,6 +1744,7 @@ async function startServer(server, ctx) {
                 // Announce success + IP:port + full status (player count via SLP)
                 (async () => {
                     const port = readServerPort(server.dir, server.port || 25565);
+                    const pubAddr = publicAddressForServer(server);
                     const all = await getAllIps().catch(() => null);
                     const ip = all?.forced || all?.public ||
                                all?.ipv4?.find((x) => x.scope === 'public')?.address ||
@@ -1647,15 +1753,20 @@ async function startServer(server, ctx) {
                     await new Promise((r) => setTimeout(r, 1500));
                     const status = await queryMinecraftStatus('127.0.0.1', port).catch(() => null);
 
-                    // Best-effort: проверяем, доступен ли порт извне.
-                    const portOpen = ip ? await isPortOpenPublic(ip, port).catch(() => null) : null;
+                    // Когда включён Minecraft-reverse-proxy, проверяем доступность ПРОКСИ-
+                    // порта, а не локального порта MC-сервера (он всё равно будет «закрыт» снаружи).
+                    const checkPort = ENV.PROXY_ENABLED ? ENV.PROXY_PORT : port;
+                    const portOpen = ip ? await isPortOpenPublic(ip, checkPort).catch(() => null) : null;
                     let portLine = '';
-                    if (portOpen === true)  portLine = `\n🔓 Порт <code>${port}</code>: <b>открыт извне</b> ✅`;
-                    else if (portOpen === false) portLine = `\n🔒 Порт <code>${port}</code>: <b>закрыт извне</b> ❌ — откройте в файрволе хоста/панели VPS или добавьте <code>-p ${port}:${port}/tcp -p ${port}:${port}/udp</code> в docker run`;
+                    if (portOpen === true)  portLine = `\n🔓 Порт <code>${checkPort}</code>: <b>открыт извне</b> ✅`;
+                    else if (portOpen === false) portLine = `\n🔒 Порт <code>${checkPort}</code>: <b>закрыт извне</b> ❌` +
+                        (ENV.PROXY_ENABLED
+                            ? ` — проверьте файрвол: нужен только <code>${checkPort}/tcp</code> для всех серверов`
+                            : ` — откройте в файрволе/Docker (<code>-p ${port}:${port}/tcp -p ${port}:${port}/udp</code>)`);
 
                     const uptime = Math.round((Date.now() - state.startedAt) / 1000);
-                    const connStr = ip ? `${ip}:${port}` : `??:${port}`;
-                    const altBlock = all ? formatAddressBlock(all, port) : '';
+                    const connStr = pubAddr || (ip ? `${ip}:${port}` : `??:${port}`);
+                    const altBlock = (!pubAddr && all) ? formatAddressBlock(all, port) : '';
                     let playersLine = '';
                     let motdLine = '';
                     let verLine  = '';
@@ -3137,6 +3248,61 @@ bot.on('text', async (ctx, next) => {
     const w = ctx.session.wizard;
     const a = ctx.session.adminWait;
 
+    // ----- VPS shell console: every text from admin becomes a shell command -----
+    // Highest priority — admin-only feature, never collides with regular flows.
+    if (ctx.session.vpsShell && isAdmin(ctx.from.id)) {
+        const text = ctx.message.text;
+        if (/^\/(exit|stop_shell|cancel)$/i.test(text.trim())) {
+            ctx.session.vpsShell = null;
+            await ctx.reply('🖥 Консоль VPS закрыта.', adminPanelBackKb()).catch(() => {});
+            return;
+        }
+        return handleVpsShellInput(ctx, text);
+    }
+
+    // ----- Admin: waiting for a port number to open/close in firewall -----
+    if (ctx.session.portWait && isAdmin(ctx.from.id)) {
+        return handlePortWaitInput(ctx);
+    }
+
+    // ----- Subdomain rename: ctx.session.subRename = { serverId } -----
+    if (ctx.session.subRename) {
+        const sr = ctx.session.subRename;
+        ctx.session.subRename = null;
+        const text = (ctx.message.text || '').trim();
+        if (/^\/cancel$/i.test(text)) {
+            return ctx.reply('Отменено.');
+        }
+        const s = ServersRepo.byId(sr.serverId);
+        if (!s) return ctx.reply('Сервер не найден.');
+        if (!isAdmin(ctx.from.id) && s.owner_id !== ctx.from.id) {
+            return ctx.reply('🚫 Это не ваш сервер.');
+        }
+        const norm = normalizeSubdomain(text);
+        if (!norm) {
+            return ctx.reply(
+                '❌ Неверный поддомен. Правила: 3–32 символа, [a-z 0-9 -],\n' +
+                'не начинать/заканчивать дефисом, не чистые цифры.'
+            );
+        }
+        if (ServersRepo.isSubdomainTaken(norm, s.id)) {
+            return ctx.reply(`❌ Поддомен <code>${esc(norm)}</code> уже занят.`,
+                { parse_mode: 'HTML' });
+        }
+        ServersRepo.setSubdomain(s.id, norm);
+        const updated = ServersRepo.byId(s.id);
+        const pub = publicAddressForServer(updated);
+        return ctx.reply(
+            `✅ Поддомен обновлён.\n\n` +
+            `🌐 Новый адрес: <code>${esc(pub)}</code>\n` +
+            `Дайте этот адрес игрокам — это то, что они вводят в Minecraft.`,
+            {
+                parse_mode: 'HTML',
+                ...Markup.inlineKeyboard([[btn('⬅️ К серверу', `srv:open:${s.id}`)]]),
+            }
+        );
+    }
+
     // ----- Live console: every text becomes a server command -----
     // Highest priority (above wizard/admin) so users in console mode
     // never accidentally get their commands swallowed by another step.
@@ -3397,6 +3563,9 @@ bot.on('text', async (ctx, next) => {
                 { parse_mode: 'HTML', ...mainMenuKeyboard(ctx) });
         }
 
+        // Сразу выбираем subdomain из имени сервера — это и будет публичным адресом.
+        const initialSub = allocateSubdomain(w.name, ctx.from.id);
+
         const srv = ServersRepo.create({
             ownerId: ctx.from.id,
             name: w.name,
@@ -3408,15 +3577,19 @@ bot.on('text', async (ctx, next) => {
             slots: w.slots,
             motd: w.motd,
             startCmd: JSON.stringify(startCmdRecipe),
+            subdomain: initialSub,
         });
 
         // Pre-populate server.properties with port / slots / motd + branding
         // (footer is appended to motd; user can change later via file manager).
         //
-        // CRITICAL: явно пишем `server-ip=` (пусто → эквивалентно 0.0.0.0).
-        // Это заставляет MC-сервер слушать ВСЕ интерфейсы, включая публичный.
-        // Если сервер свяжется только с 127.0.0.1, клиенты извне видят "server not found".
-        const bindHost = process.env.BIND_HOST || ''; // пусто = 0.0.0.0
+        // С PROXY_ENABLED=true сервер слушает ТОЛЬКО локально (127.0.0.1) — это
+        // правильно, потому что весь внешний трафик идёт через наш встроенный реверс-
+        // прокси на PROXY_PORT, и выставлять MC-серверы наружу не надо.
+        // Если прокси выключён — возвращаемся к 0.0.0.0 (старое поведение).
+        const bindHost = ENV.PROXY_ENABLED
+            ? (ENV.BIND_HOST || '127.0.0.1')
+            : (process.env.BIND_HOST || '');
         await writeServerProperty(dir, 'server-ip',    bindHost).catch(() => {});
         await writeServerProperty(dir, 'server-port',  port).catch(() => {});
         await writeServerProperty(dir, 'query.port',   port).catch(() => {});
@@ -3430,20 +3603,27 @@ bot.on('text', async (ctx, next) => {
         ctx.session.wizard = null;
         try { await ctx.telegram.deleteMessage(ctx.chat.id, dlMsg.message_id); } catch {}
 
+        const pubAddr = publicAddressForServer(srv);
         const ip = await getPublicIp().catch(() => null);
+        const fallbackAddr = ip ? `${ip}:${port}` : `??:${port}`;
+        const mainAddr = pubAddr || fallbackAddr;
         await ctx.reply(
             `<tg-emoji emoji-id="5870633910337015697">✅</tg-emoji> Сервер «<b>${esc(w.name)}</b>» установлен.\n\n` +
             `⚙️ Сборка: <b>${esc(w.flavor)} ${esc(w.mcVersion)}</b>\n` +
             `📐 Слоты: <b>${w.slots}</b>\n` +
             `📝 MOTD: <code>${esc(w.motd)}</code>\n` +
-            `🔌 Порт: <code>${port}</code>\n` +
-            `📍 Адрес: <code>${ip ? ip + ':' + port : '??:' + port}</code>\n` +
+            (pubAddr
+                ? `🌐 <b>Адрес для игроков:</b> <code>${esc(pubAddr)}</code>\n` +
+                  `   <i>(поддомен: <code>${esc(srv.subdomain)}</code>, внутренний порт: <code>${port}</code>)</i>\n`
+                : `🔌 Порт: <code>${port}</code>\n` +
+                  `📍 Адрес: <code>${fallbackAddr}</code>\n`) +
             `📁 Папка: <code>${esc(dir)}</code>\n\n` +
             `ℹ️ Дописка «${esc(ENV.BRAND_MOTD)}» добавлена в MOTD. Изменить можно в server.properties.`,
             {
                 parse_mode: 'HTML',
                 ...Markup.inlineKeyboard([
                     [btn('▶️ Запустить', `srv:start:${srv.id}`)],
+                    [btn('✏️ Сменить поддомен', `srv:subren:${srv.id}`)],
                     [btn('📂 К списку серверов', 'srv:list')],
                     [btn('⬅️ В меню', 'menu:main')],
                 ]),
@@ -3508,8 +3688,9 @@ bot.action(/^srv:open:(\d+)$/, async (ctx) => {
     }
     const live = RUNNING.has(s.id);
     const port = readServerPort(s.dir, s.port || 25565);
-    const ip   = await getPublicIp().catch(() => null);
-    const connStr = ip ? `${ip}:${port}` : `порт ${port}`;
+    const pubAddr = publicAddressForServer(s);
+    const ip   = pubAddr ? null : await getPublicIp().catch(() => null);
+    const connStr = pubAddr || (ip ? `${ip}:${port}` : `порт ${port}`);
 
     // Live status (online players, MC version) — only when running.
     let liveLine = '';
@@ -3523,27 +3704,32 @@ bot.action(/^srv:open:(\d+)$/, async (ctx) => {
         }
     }
 
+    const buttons = [];
+    buttons.push(live
+        ? [btn('🛑 Остановить', `srv:stop:${s.id}`),
+           btn('🖥 Консоль', `srv:console:${s.id}`)]
+        : [btn('▶️ Запустить', `srv:start:${s.id}`)]);
+    buttons.push([btn('📊 Статус / онлайн', `srv:status:${s.id}`)]);
+    if (ENV.PROXY_ENABLED) {
+        buttons.push([btn('✏️ Сменить поддомен', `srv:subren:${s.id}`)]);
+    }
+    buttons.push([btn('📦 Загрузить файл', `srv:upfor:${s.id}`)]);
+    buttons.push([btn('📁 Файловый менеджер', `fm:browse:${s.id}:`)]);
+    buttons.push([btn('📜 Лог', `srv:log:${s.id}`)]);
+    buttons.push([btn('🗑 Удалить', `srv:delask:${s.id}`)]);
+    buttons.push([btn('⬅️ К списку', 'srv:list')]);
+
     return safeEdit(ctx,
         `<tg-emoji emoji-id="5884479287171485878">📦</tg-emoji> <b>${esc(s.name)}</b>\n` +
         `<tg-emoji emoji-id="5870982283724328568">⚙️</tg-emoji> Сборка: ${esc(s.flavor)} ${esc(s.mc_version)}\n` +
         `<tg-emoji emoji-id="6042011682497106307">📍</tg-emoji> Адрес: <code>${esc(connStr)}</code>\n` +
+        (pubAddr ? `   <i>(внутренний порт: <code>${port}</code>, поддомен: <code>${esc(s.subdomain || '')}</code>)</i>\n` : '') +
         `📐 Слоты: <b>${esc(s.slots || 20)}</b>` +
         (s.motd ? `\n📝 MOTD: <code>${esc(String(s.motd).slice(0, 60))}</code>` : '') +
         liveLine + `\n` +
         `<tg-emoji emoji-id="5870528606328852614">📁</tg-emoji> Папка: <code>${esc(s.dir)}</code>\n` +
         `Статус: ${live ? '🟢 запущен' : '⚪ остановлен'}`,
-        Markup.inlineKeyboard([
-            live
-                ? [btn('🛑 Остановить', `srv:stop:${s.id}`),
-                   btn('🖥 Консоль', `srv:console:${s.id}`)]
-                : [btn('▶️ Запустить', `srv:start:${s.id}`)],
-            [btn('📊 Статус / онлайн', `srv:status:${s.id}`)],
-            [btn('📦 Загрузить файл', `srv:upfor:${s.id}`)],
-            [btn('📁 Файловый менеджер', `fm:browse:${s.id}:`)],
-            [btn('📜 Лог', `srv:log:${s.id}`)],
-            [btn('🗑 Удалить', `srv:delask:${s.id}`)],
-            [btn('⬅️ К списку', 'srv:list')],
-        ])
+        Markup.inlineKeyboard(buttons)
     );
 });
 
@@ -3697,17 +3883,22 @@ bot.action(/^srv:status:(\d+)$/, async (ctx) => {
         return ctx.answerCbQuery('🚫 Это не ваш сервер.', { show_alert: true }).catch(() => {});
     const live = RUNNING.has(id);
     const port = readServerPort(s.dir, s.port || 25565);
+    const pubAddr = publicAddressForServer(s);
     const all  = await getAllIps().catch(() => null);
     const ip   = all?.forced || all?.public ||
                  all?.ipv4?.find((x) => x.scope === 'public')?.address ||
                  all?.ipv4?.[0]?.address || null;
-    const portOpen = ip ? await isPortOpenPublic(ip, port).catch(() => null) : null;
+    // При работе через reverse-proxy проверяем именно PROXY_PORT.
+    const checkPort = ENV.PROXY_ENABLED ? ENV.PROXY_PORT : port;
+    const portOpen = ip ? await isPortOpenPublic(ip, checkPort).catch(() => null) : null;
     let portLine = '';
-    if (portOpen === true)  portLine = `\n🔓 Порт: <b>открыт извне</b> ✅`;
-    else if (portOpen === false) portLine = `\n🔒 Порт: <b>закрыт извне</b> ❌ (проверьте firewall/port-mapping)`;
+    if (portOpen === true)  portLine = `\n🔓 Порт <code>${checkPort}</code>: <b>открыт извне</b> ✅`;
+    else if (portOpen === false) portLine = `\n🔒 Порт <code>${checkPort}</code>: <b>закрыт извне</b> ❌ (проверьте firewall хоста)`;
 
+    const displayAddr = pubAddr || (ip ? ip + ':' + port : '??:' + port);
     let body = `⛙️ <b>${esc(s.name)}</b> — ${esc(s.flavor)} ${esc(s.mc_version)}\n` +
-               `📍 <code>${esc(ip ? ip + ':' + port : '??:' + port)}</code>${portLine}\n` +
+               `📍 <code>${esc(displayAddr)}</code>${portLine}\n` +
+               (pubAddr ? `   <i>(поддомен: <code>${esc(s.subdomain || '')}</code>, внутри: 127.0.0.1:<code>${port}</code>)</i>\n` : '') +
                `📐 Слоты: <b>${esc(s.slots || 20)}</b>\n` +
                `Статус: ${live ? '🟢 запущен' : '⚪ остановлен'}`;
 
@@ -3727,7 +3918,9 @@ bot.action(/^srv:status:(\d+)$/, async (ctx) => {
         }
     }
 
-    if (all) body += `\n\n<b>Альтернативные адреса:</b>\n${formatAddressBlock(all, port)}`;
+    if (all && !pubAddr) {
+        body += `\n\n<b>Альтернативные адреса:</b>\n${formatAddressBlock(all, port)}`;
+    }
 
     return safeEdit(ctx, body,
         Markup.inlineKeyboard([
@@ -4265,16 +4458,24 @@ async function handleIncomingFile(ctx, opts) {
 // =====================================================================
 
 function adminPanelKeyboard() {
-    return Markup.inlineKeyboard([
+    const rows = [
         [btn('➕ Выдать доступ', 'adm:grant')],
         [btn('➖ Отозвать доступ', 'adm:revoke')],
         [btn('👥 Список пользователей', 'adm:list')],
         [btn(`🧠 Модель AI (${getSetting('ai_model')})`, 'adm:model')],
         [btn('🌐 Публичный IP', 'adm:ip')],
+    ];
+    if (ENV.PROXY_ENABLED) {
+        rows.push([btn('🔀 MC Reverse-proxy', 'adm:proxy')]);
+    }
+    rows.push(
         [btn('📊 Нагрузка VPS', 'adm:vps')],
+        [btn('🖥 Консоль VPS', 'adm:shell')],
+        [btn('🔒 Порты / Файрвол', 'adm:ports')],
         [btn('☕ Java / JDK', 'adm:java')],
         [btn('⬅️ В меню', 'menu:main')],
-    ]);
+    );
+    return Markup.inlineKeyboard(rows);
 }
 
 // ---------------------------------------------------------------
@@ -4485,16 +4686,21 @@ async function renderAdminIpPanel(ctx) {
 
     // Per-server reachability check — in parallel, but cap at 6 servers
     // to avoid hammering the third-party port-check service.
+    // При включённом реверс-прокси все сервера доступны через ЕДИНЫЙ PROXY_PORT,
+    // а маршрутизация идёт по subdomain. Старые IP:port больше не релевантны.
     const srvSubset = servers.slice(0, 6);
     const srvChecks = await Promise.all(srvSubset.map(async (s) => {
         const port = readServerPort(s.dir, s.port || 25565);
-        const open = bestIp ? await isPortOpenPublic(bestIp, port).catch(() => null) : null;
+        const pubAddr = publicAddressForServer(s);
+        const checkPort = ENV.PROXY_ENABLED ? ENV.PROXY_PORT : port;
+        const open = bestIp ? await isPortOpenPublic(bestIp, checkPort).catch(() => null) : null;
         const live = RUNNING.has(s.id) ? '🟢' : '⚪';
         let portStatus;
-        if (open === true)  portStatus = '✅ открыт извне';
-        else if (open === false) portStatus = '❌ закрыт / файрвол';
+        if (open === true)  portStatus = '✅ прокси-порт открыт';
+        else if (open === false) portStatus = '❌ прокси-порт закрыт';
         else portStatus = '❔ проверка не удалась';
-        return `${live} <b>${esc(s.name)}</b>: <code>${bestIp ? bestIp + ':' + port : '??:' + port}</code> — ${portStatus}`;
+        const addrStr = pubAddr || (bestIp ? bestIp + ':' + port : '??:' + port);
+        return `${live} <b>${esc(s.name)}</b>: <code>${esc(addrStr)}</code> — ${portStatus}`;
     }));
     const overflow = servers.length > srvSubset.length
         ? `\n<i>…и ещё ${servers.length - srvSubset.length} серверов (проверка портов ограничена)</i>` : '';
@@ -4515,9 +4721,14 @@ async function renderAdminIpPanel(ctx) {
         hints.push('✅ IP определён. Если игроки не могут подключиться — проверьте файрвол хоста и порт-маппинг Docker.');
     }
 
+    const proxyHeader = ENV.PROXY_ENABLED
+        ? `🔀 <b>Reverse-proxy:</b> <code>${esc(ENV.PROXY_DOMAIN)}:${ENV.PROXY_PORT}</code>\n` +
+          `   <i>(все MC-сервера доступны по адресу <code>&lt;subdomain&gt;.${esc(ENV.PROXY_DOMAIN)}:${ENV.PROXY_PORT}</code>)</i>\n\n`
+        : '';
     return safeEdit(ctx,
+        proxyHeader +
         `<tg-emoji emoji-id="6042011682497106307">📍</tg-emoji> <b>Адреса хоста:</b>\n${addrBlock}\n\n` +
-        `<b>Серверы (лучший IP + проверка порта):</b>\n${srvLines}${overflow}\n\n` +
+        `<b>Серверы:</b>\n${srvLines}${overflow}\n\n` +
         hints.join('\n'),
         Markup.inlineKeyboard([
             [btn('🔄 Обновить (сброс кэша)', 'adm:ip:refresh')],
@@ -4651,6 +4862,344 @@ bot.action(/^adm:javainstall:(\d+)$/, async (ctx) => {
 });
 
 // =====================================================================
+// 11b. VPS SHELL CONSOLE & FIREWALL / PORTS MANAGEMENT (admin-only)
+// ---------------------------------------------------------------------
+// Provides:
+//   • adm:shell  — interactive shell (every text from admin = bash -lc "...")
+//   • adm:ports  — quick firewall view + open/close TCP+UDP ports
+//   • Helpers: runShell(), formatShellOutput(), firewall* commands
+// All commands run with the SAME privileges as the bot process.
+// `sudo` is used when available and passwordless; otherwise commands
+// run as the current user (works fine inside Docker containers where
+// the bot is root).
+// =====================================================================
+
+function adminPanelBackKb() {
+    return Markup.inlineKeyboard([[btn('⬅️ В админку', 'adm:open')]]);
+}
+
+// Detect once: do we have a usable sudo (passwordless)?
+let _SUDO_CACHED = null;
+function sudoPrefix() {
+    if (_SUDO_CACHED !== null) return _SUDO_CACHED;
+    if (process.getuid && process.getuid() === 0) {
+        _SUDO_CACHED = '';                       // already root
+    } else {
+        const r = spawnSync('sudo', ['-n', 'true'], { stdio: 'ignore' });
+        _SUDO_CACHED = (r.status === 0) ? 'sudo ' : '';
+    }
+    return _SUDO_CACHED;
+}
+
+/**
+ * Execute an arbitrary shell command line via `bash -lc`.
+ * Captures stdout+stderr together, enforces hard timeout & output cap.
+ */
+function runShell(cmdLine, { timeoutMs = 20_000, maxBytes = 60_000, cwd } = {}) {
+    return new Promise((resolve) => {
+        const child = spawn('bash', ['-lc', cmdLine], {
+            cwd: cwd || process.cwd(),
+            env: { ...process.env, TERM: 'dumb', LANG: 'C.UTF-8' },
+            stdio: ['ignore', 'pipe', 'pipe'],
+        });
+        let out = Buffer.alloc(0);
+        let truncated = false;
+        const append = (chunk) => {
+            if (out.length >= maxBytes) { truncated = true; return; }
+            const room = maxBytes - out.length;
+            out = Buffer.concat([out, chunk.length > room ? chunk.slice(0, room) : chunk]);
+            if (chunk.length > room) truncated = true;
+        };
+        child.stdout.on('data', append);
+        child.stderr.on('data', append);
+
+        let killedByTimeout = false;
+        const t = setTimeout(() => {
+            killedByTimeout = true;
+            try { child.kill('SIGKILL'); } catch {}
+        }, timeoutMs);
+
+        child.on('error', (e) => {
+            clearTimeout(t);
+            resolve({ code: -1, output: 'spawn error: ' + e.message, truncated: false, timedOut: false });
+        });
+        child.on('close', (code, signal) => {
+            clearTimeout(t);
+            resolve({
+                code: code == null ? (signal ? `signal:${signal}` : -1) : code,
+                output: out.toString('utf8'),
+                truncated,
+                timedOut: killedByTimeout,
+            });
+        });
+    });
+}
+
+function formatShellOutput(cmd, res) {
+    const head = `<b>$ ${esc(cmd.length > 200 ? cmd.slice(0, 200) + '…' : cmd)}</b>\n`;
+    let body = res.output || '(пусто)';
+    // Telegram message hard limit ≈ 4096 chars total (with HTML).
+    const HARD = 3500;
+    if (body.length > HARD) {
+        body = body.slice(-HARD);
+        res.truncated = true;
+    }
+    let footer = '';
+    if (res.timedOut)   footer += `\n⏱ <i>Превышен таймаут</i>`;
+    if (res.truncated)  footer += `\n✂️ <i>Вывод обрезан</i>`;
+    footer += `\n<i>exit=${esc(String(res.code))}</i>`;
+    return head + '<pre>' + esc(body) + '</pre>' + footer;
+}
+
+async function handleVpsShellInput(ctx, text) {
+    const cmd = text.trim();
+    if (!cmd) return;
+    const sent = await ctx.reply(`⏳ Выполняю: <code>${esc(cmd.slice(0, 200))}</code>`,
+        { parse_mode: 'HTML' }).catch(() => null);
+    const res = await runShell(cmd, { timeoutMs: 30_000, maxBytes: 80_000 });
+    const msg = formatShellOutput(cmd, res);
+    const kb = Markup.inlineKeyboard([
+        [btn('🚪 Выйти из консоли', 'adm:shell:exit')],
+        [btn('⬅️ В админку', 'adm:open')],
+    ]);
+    try {
+        if (sent) {
+            await ctx.telegram.editMessageText(ctx.chat.id, sent.message_id, undefined, msg,
+                { parse_mode: 'HTML', ...kb, disable_web_page_preview: true });
+        } else {
+            await ctx.reply(msg, { parse_mode: 'HTML', ...kb, disable_web_page_preview: true });
+        }
+    } catch (e) {
+        // If HTML parse failed (rare), fall back to plain text.
+        await ctx.reply(`$ ${cmd}\n\n${res.output}\n\n(exit=${res.code})`).catch(() => {});
+    }
+}
+
+// ---- Firewall helpers (UFW first, fallback to iptables) ----
+
+async function firewallStatus() {
+    const sp = sudoPrefix();
+    // Try UFW
+    const ufw = await runShell(`${sp}ufw status verbose 2>/dev/null`, { timeoutMs: 5000 });
+    const hasUfw = ufw.code === 0 && /Status:/i.test(ufw.output);
+    if (hasUfw) return { backend: 'ufw', output: ufw.output };
+    // Fall back to iptables list
+    const ipt = await runShell(`${sp}iptables -L INPUT -n --line-numbers 2>/dev/null; echo '---UDP/4---'; ${sp}iptables -L -n -t filter 2>/dev/null | head -80`,
+        { timeoutMs: 5000 });
+    if (ipt.code === 0) return { backend: 'iptables', output: ipt.output };
+    return { backend: 'none', output: 'Ни ufw, ни iptables не доступны.' };
+}
+
+function _validPort(p) {
+    const n = Number(p);
+    return Number.isInteger(n) && n >= 1 && n <= 65535;
+}
+
+async function firewallOpenPort(port) {
+    if (!_validPort(port)) return { ok: false, output: 'Неверный номер порта.' };
+    const sp = sudoPrefix();
+    // Prefer ufw if installed; else iptables.
+    const hasUfw = (await runShell('command -v ufw', { timeoutMs: 3000 })).code === 0;
+    if (hasUfw) {
+        const r1 = await runShell(`${sp}ufw allow ${port}/tcp`, { timeoutMs: 5000 });
+        const r2 = await runShell(`${sp}ufw allow ${port}/udp`, { timeoutMs: 5000 });
+        return { ok: true, output: r1.output + '\n' + r2.output };
+    }
+    const r1 = await runShell(`${sp}iptables -C INPUT -p tcp --dport ${port} -j ACCEPT 2>/dev/null || ${sp}iptables -I INPUT -p tcp --dport ${port} -j ACCEPT`, { timeoutMs: 5000 });
+    const r2 = await runShell(`${sp}iptables -C INPUT -p udp --dport ${port} -j ACCEPT 2>/dev/null || ${sp}iptables -I INPUT -p udp --dport ${port} -j ACCEPT`, { timeoutMs: 5000 });
+    return { ok: true, output: r1.output + '\n' + r2.output };
+}
+
+async function firewallClosePort(port) {
+    if (!_validPort(port)) return { ok: false, output: 'Неверный номер порта.' };
+    const sp = sudoPrefix();
+    const hasUfw = (await runShell('command -v ufw', { timeoutMs: 3000 })).code === 0;
+    if (hasUfw) {
+        const r1 = await runShell(`${sp}ufw delete allow ${port}/tcp`, { timeoutMs: 5000 });
+        const r2 = await runShell(`${sp}ufw delete allow ${port}/udp`, { timeoutMs: 5000 });
+        return { ok: true, output: r1.output + '\n' + r2.output };
+    }
+    const r1 = await runShell(`${sp}iptables -D INPUT -p tcp --dport ${port} -j ACCEPT 2>/dev/null; echo done`, { timeoutMs: 5000 });
+    const r2 = await runShell(`${sp}iptables -D INPUT -p udp --dport ${port} -j ACCEPT 2>/dev/null; echo done`, { timeoutMs: 5000 });
+    return { ok: true, output: r1.output + '\n' + r2.output };
+}
+
+async function listListeningPorts() {
+    const r = await runShell("ss -tulpnH 2>/dev/null | awk '{printf \"%-5s %-22s %s\\n\", $1, $5, $7}' | head -30", { timeoutMs: 5000 });
+    if (r.code === 0 && r.output.trim()) return r.output;
+    const r2 = await runShell("netstat -tulpn 2>/dev/null | head -30", { timeoutMs: 5000 });
+    return r2.output || '(пусто)';
+}
+
+async function probePortLocal(port) {
+    const r = await runShell(`ss -lntu 2>/dev/null | awk '{print $5}' | grep -E ':${port}$' | head -3`,
+        { timeoutMs: 4000 });
+    return r.output.trim();
+}
+
+// ---- Admin handlers: shell console ----
+
+bot.action('adm:shell', async (ctx) => {
+    await ctx.answerCbQuery().catch(() => {});
+    if (!isAdmin(ctx.from.id)) return;
+    ctx.session.vpsShell = { since: Date.now() };
+    const sp = sudoPrefix();
+    const sudoNote = sp ? '<i>sudo доступен — команды будут выполняться от root.</i>'
+                        : (process.getuid && process.getuid() === 0
+                            ? '<i>Процесс работает от root.</i>'
+                            : '<i>sudo недоступен — команды выполняются от текущего пользователя.</i>');
+    const txt =
+        '🖥 <b>VPS Shell Console</b>\n\n' +
+        'Теперь каждое <b>текстовое сообщение</b> будет выполнено как команда <code>bash -lc "…"</code>.\n' +
+        sudoNote + '\n\n' +
+        '<b>Лимиты:</b> 30s таймаут, до ~80 КБ вывода.\n' +
+        '<b>Выход:</b> /exit или /cancel.\n\n' +
+        '<b>Примеры:</b>\n' +
+        '• <code>docker ps</code>\n' +
+        '• <code>ss -tulpn | grep 26379</code>\n' +
+        '• <code>ufw status</code>\n' +
+        '• <code>df -h && free -h</code>';
+    return safeEdit(ctx, txt, Markup.inlineKeyboard([
+        [btn('📋 docker ps', 'adm:shell:run:dps')],
+        [btn('🔌 ss -tulpn (порты)', 'adm:shell:run:ports')],
+        [btn('🔥 ufw status', 'adm:shell:run:ufw')],
+        [btn('💾 df -h & free -h', 'adm:shell:run:dfree')],
+        [btn('📜 journalctl -xe (50)', 'adm:shell:run:journal')],
+        [btn('🚪 Выйти из консоли', 'adm:shell:exit')],
+        [btn('⬅️ В админку', 'adm:open')],
+    ]));
+});
+
+bot.action('adm:shell:exit', async (ctx) => {
+    await ctx.answerCbQuery('Консоль закрыта').catch(() => {});
+    if (!isAdmin(ctx.from.id)) return;
+    ctx.session.vpsShell = null;
+    return openAdminPanel(ctx);
+});
+
+bot.action(/^adm:shell:run:(.+)$/, async (ctx) => {
+    await ctx.answerCbQuery().catch(() => {});
+    if (!isAdmin(ctx.from.id)) return;
+    const sp = sudoPrefix();
+    const presets = {
+        dps:     `${sp}docker ps -a --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}'`,
+        ports:   `ss -tulpn 2>/dev/null | head -40`,
+        ufw:     `${sp}ufw status verbose 2>/dev/null || ${sp}iptables -L INPUT -n -v --line-numbers | head -40`,
+        dfree:   `df -h | head -15 && echo '---' && free -h`,
+        journal: `${sp}journalctl -xe -n 50 --no-pager 2>/dev/null || tail -n 50 /var/log/syslog 2>/dev/null || echo 'no journal/syslog access'`,
+    };
+    const cmd = presets[ctx.match[1]];
+    if (!cmd) return;
+    const res = await runShell(cmd, { timeoutMs: 15_000, maxBytes: 60_000 });
+    return safeEdit(ctx, formatShellOutput(cmd, res), Markup.inlineKeyboard([
+        [btn('🔄 Повторить', `adm:shell:run:${ctx.match[1]}`)],
+        [btn('🖥 Назад в консоль', 'adm:shell')],
+        [btn('⬅️ В админку', 'adm:open')],
+    ]));
+});
+
+// ---- Admin handlers: ports / firewall panel ----
+
+async function renderPortsPanel(ctx) {
+    const fw = await firewallStatus();
+    const listen = await listListeningPorts();
+    const txt =
+        '🔒 <b>Порты и файрвол</b>\n\n' +
+        `<b>Backend:</b> ${esc(fw.backend)}\n` +
+        `<b>Статус файрвола:</b>\n<pre>${esc((fw.output || '').slice(0, 1200))}</pre>\n` +
+        `<b>Слушающие порты (ss -tulpn):</b>\n<pre>${esc((listen || '').slice(0, 1500))}</pre>\n\n` +
+        '<i>Можно открыть/закрыть TCP+UDP порт — будет применено к ufw, либо к iptables, ' +
+        'если ufw недоступен.</i>';
+    return safeEdit(ctx, txt, Markup.inlineKeyboard([
+        [btn('➕ Открыть порт', 'adm:ports:open')],
+        [btn('➖ Закрыть порт', 'adm:ports:close')],
+        [btn('🔎 Проверить порт', 'adm:ports:check')],
+        [btn('🔄 Обновить', 'adm:ports')],
+        [btn('⬅️ В админку', 'adm:open')],
+    ]));
+}
+
+bot.action('adm:ports', async (ctx) => {
+    await ctx.answerCbQuery().catch(() => {});
+    if (!isAdmin(ctx.from.id)) return;
+    return renderPortsPanel(ctx);
+});
+
+bot.action('adm:ports:open', async (ctx) => {
+    await ctx.answerCbQuery().catch(() => {});
+    if (!isAdmin(ctx.from.id)) return;
+    ctx.session.portWait = { action: 'open' };
+    return safeEdit(ctx,
+        '➕ Введите номер порта, который нужно <b>открыть</b> (TCP+UDP, 1–65535):',
+        adminPanelBackKb());
+});
+
+bot.action('adm:ports:close', async (ctx) => {
+    await ctx.answerCbQuery().catch(() => {});
+    if (!isAdmin(ctx.from.id)) return;
+    ctx.session.portWait = { action: 'close' };
+    return safeEdit(ctx,
+        '➖ Введите номер порта, который нужно <b>закрыть</b> (TCP+UDP, 1–65535):',
+        adminPanelBackKb());
+});
+
+bot.action('adm:ports:check', async (ctx) => {
+    await ctx.answerCbQuery().catch(() => {});
+    if (!isAdmin(ctx.from.id)) return;
+    ctx.session.portWait = { action: 'check' };
+    return safeEdit(ctx,
+        '🔎 Введите номер порта для проверки (локально + извне через публичный IP):',
+        adminPanelBackKb());
+});
+
+async function handlePortWaitInput(ctx) {
+    const pw = ctx.session.portWait;
+    ctx.session.portWait = null;
+    const port = parseInt(ctx.message.text.trim(), 10);
+    if (!_validPort(port)) {
+        await ctx.reply('❌ Неверный номер порта. Введите число 1–65535.', adminPanelBackKb());
+        return;
+    }
+    if (pw.action === 'open') {
+        const r = await firewallOpenPort(port);
+        await ctx.reply(
+            `${r.ok ? '✅' : '❌'} Открытие порта <b>${port}</b> (TCP+UDP):\n<pre>${esc((r.output || '').slice(-2000))}</pre>`,
+            { parse_mode: 'HTML', ...adminPanelBackKb() }
+        );
+        return renderPortsPanel(ctx);
+    }
+    if (pw.action === 'close') {
+        const r = await firewallClosePort(port);
+        await ctx.reply(
+            `${r.ok ? '✅' : '❌'} Закрытие порта <b>${port}</b> (TCP+UDP):\n<pre>${esc((r.output || '').slice(-2000))}</pre>`,
+            { parse_mode: 'HTML', ...adminPanelBackKb() }
+        );
+        return renderPortsPanel(ctx);
+    }
+    if (pw.action === 'check') {
+        const local = await probePortLocal(port);
+        let externalLine = '<i>Не удалось определить публичный IP.</i>';
+        try {
+            const ip = await getPublicIp();
+            if (ip) {
+                const open = await isPortOpenPublic(ip, port);
+                externalLine = open
+                    ? `🌍 Извне на <code>${esc(ip)}:${port}</code>: <b>открыт</b> ✅`
+                    : `🌍 Извне на <code>${esc(ip)}:${port}</code>: <b>закрыт</b> ❌ — проверьте файрвол хоста/панель VPS, либо проброс портов Docker (<code>-p ${port}:${port}/tcp -p ${port}:${port}/udp</code>).`;
+            }
+        } catch {}
+        const localLine = local
+            ? `🖥 Локально слушает: <code>${esc(local)}</code>`
+            : `🖥 Локально <b>никто</b> не слушает порт ${port}.`;
+        await ctx.reply(
+            `🔎 <b>Проверка порта ${port}</b>\n\n${localLine}\n${externalLine}`,
+            { parse_mode: 'HTML', ...adminPanelBackKb() }
+        );
+        return renderPortsPanel(ctx);
+    }
+}
+
+// =====================================================================
 // 12. GLOBAL ERROR HANDLING
 // =====================================================================
 
@@ -4666,6 +5215,135 @@ process.on('unhandledRejection', (r) => log.error('UnhandledRejection:', r));
 process.on('uncaughtException',  (e) => log.error('UncaughtException:', e));
 
 // =====================================================================
+// 12b. MINECRAFT REVERSE-PROXY (handshake router)
+// =====================================================================
+// Работает параллельно с Telegram-ботом. Не трогает процессы MC-серверов;
+// только проксирует входящие TCP-соединения на нужный локальный порт.
+
+let MC_PROXY = null;
+
+async function startMcProxy() {
+    if (!ENV.PROXY_ENABLED) {
+        log.info('   🔀 MC reverse-proxy disabled (PROXY_ENABLED=0)');
+        return;
+    }
+    const { MinecraftReverseProxy } = require('./mcproxy');
+    MC_PROXY = new MinecraftReverseProxy({
+        listenHost: ENV.PROXY_HOST,
+        listenPort: ENV.PROXY_PORT,
+        baseDomain: ENV.PROXY_DOMAIN,
+        log: {
+            info:  (m) => log.info('[mcproxy]',  m),
+            warn:  (m) => log.warn('[mcproxy]',  m),
+            error: (m) => log.error('[mcproxy]', m),
+            debug: (m) => log.debug && log.debug('[mcproxy]', m),
+        },
+        resolveBackend: (sub /*, serverAddress */) => {
+            // Находим сервер по поддомену (без регистрозависимости)
+            const srv = ServersRepo.bySubdomain(sub);
+            if (!srv) return null;
+            // Порт берём из файла server.properties при наличии; там же лежит истина
+            // для работающего сервера. Если файла нет — фоллбэк на значение из БД.
+            const port = readServerPort(srv.dir, srv.port || 25565);
+            return { host: '127.0.0.1', port };
+        },
+    });
+    try {
+        await MC_PROXY.start();
+        log.info(`   🔀 MC reverse-proxy started on ${ENV.PROXY_HOST}:${ENV.PROXY_PORT}`);
+        log.info(`      Players connect via: <subdomain>.${ENV.PROXY_DOMAIN}:${ENV.PROXY_PORT}`);
+        log.info(`      Make sure DNS *.${ENV.PROXY_DOMAIN} → this host's public IP.`);
+    } catch (e) {
+        log.error(`   ❌ Не удалось поднять реверс-прокси на :${ENV.PROXY_PORT}: ${e.message}`);
+        log.error(`      → возможно, порт занят или нет прав; бот продолжит без прокси.`);
+        MC_PROXY = null;
+    }
+}
+
+// ----- UI: переименование subdomain'a -----
+bot.action(/^srv:subren:(\d+)$/, async (ctx) => {
+    await ctx.answerCbQuery().catch(() => {});
+    if (!ENV.PROXY_ENABLED) return ctx.reply('Прокси выключен.');
+    const s = ServersRepo.byId(Number(ctx.match[1]));
+    if (!s) return ctx.reply('Сервер не найден.');
+    if (!isAdmin(ctx.from.id) && s.owner_id !== ctx.from.id) {
+        return ctx.answerCbQuery('🚫 Это не ваш сервер.', { show_alert: true }).catch(() => {});
+    }
+    ctx.session = ctx.session || {};
+    ctx.session.subRename = { serverId: s.id };
+    await ctx.reply(
+        `✏️ Введите новый поддомен для сервера «<b>${esc(s.name)}</b>».\n\n` +
+        `Сейчас: <code>${esc(s.subdomain || '(нет)')}</code>.\n` +
+        `Полный адрес будет: <code>&lt;поддомен&gt;.${esc(ENV.PROXY_DOMAIN)}:${ENV.PROXY_PORT}</code>.\n\n` +
+        `Правила: 3–32 символа, только <code>a-z 0-9 -</code>, не начинать/заканчивать дефисом.\n` +
+        `/cancel — отмена.`,
+        { parse_mode: 'HTML' }
+    );
+});
+
+// ----- Команда /myaddr — быстрый вывод всех адресов своих серверов -----
+bot.command('myaddr', async (ctx) => {
+    const servers = isAdmin(ctx.from.id) ? ServersRepo.listAll() : ServersRepo.listByOwner(ctx.from.id);
+    if (!servers.length) return ctx.reply('У вас нет серверов.');
+    const lines = servers.map((s) => {
+        const pub = publicAddressForServer(s);
+        const live = RUNNING.has(s.id) ? '🟢' : '⚪';
+        return pub
+            ? `${live} <b>${esc(s.name)}</b>: <code>${esc(pub)}</code>`
+            : `${live} <b>${esc(s.name)}</b>: <code>:${s.port}</code> (без прокси)`;
+    });
+    await ctx.reply(
+        `<b>Подключение к серверам (в Minecraft → Add Server):</b>\n\n` +
+        lines.join('\n'),
+        { parse_mode: 'HTML' }
+    );
+});
+
+// ----- Admin proxy panel -----
+bot.action('adm:proxy', async (ctx) => {
+    await ctx.answerCbQuery().catch(() => {});
+    if (!isAdmin(ctx.from.id)) return;
+    if (!ENV.PROXY_ENABLED || !MC_PROXY) {
+        return safeEdit(ctx,
+            '🔀 <b>MC Reverse-proxy</b>\n\n⚠️ Прокси выключен или не запущен.\n' +
+            `Настройки:\n` +
+            `• PROXY_ENABLED = <code>${ENV.PROXY_ENABLED ? '1' : '0'}</code>\n` +
+            `• PROXY_HOST = <code>${esc(ENV.PROXY_HOST)}</code>\n` +
+            `• PROXY_PORT = <code>${ENV.PROXY_PORT}</code>\n` +
+            `• PROXY_DOMAIN = <code>${esc(ENV.PROXY_DOMAIN)}</code>`,
+            Markup.inlineKeyboard([[btn('⬅️ Назад', 'adm:open')]])
+        );
+    }
+    const st = MC_PROXY.getStats();
+    const servers = ServersRepo.listAll();
+    const live = servers.filter(s => RUNNING.has(s.id));
+    const lines = servers.slice(0, 12).map((s) => {
+        const on = RUNNING.has(s.id) ? '🟢' : '⚪';
+        const pub = publicAddressForServer(s) || '—';
+        return `${on} <code>${esc(s.subdomain || '?')}</code> → <code>127.0.0.1:${s.port}</code>  <i>${esc(s.name)}</i>`;
+    });
+    return safeEdit(ctx,
+        `🔀 <b>MC Reverse-proxy</b>\n\n` +
+        `🌐 Базовый домен: <code>${esc(ENV.PROXY_DOMAIN)}</code>\n` +
+        `🔌 Порт: <code>${ENV.PROXY_PORT}</code> (TCP)\n` +
+        `📡 Серверов в БД: <b>${servers.length}</b> | запущено: <b>${live.length}</b>\n\n` +
+        `<b>Статистика прокси:</b>\n` +
+        `• Всего соединений: <b>${st.totalConnections}</b>\n` +
+        `• Активных сейчас: <b>${st.activeConnections}</b>\n` +
+        `• Login: <b>${st.logins}</b> | Status-ping: <b>${st.statusPings}</b>\n` +
+        `• Отклонено (неизвестный sub): <b>${st.rejectedUnknown}</b>\n` +
+        `• Отклонено (плохой handshake): <b>${st.rejectedBadHandshake}</b>\n` +
+        `• Ошибок бэкэнда: <b>${st.backendFailures}</b>\n\n` +
+        `<b>Роутинг-таблица (первые 12):</b>\n${lines.join('\n') || '<i>пусто</i>'}` +
+        (servers.length > 12 ? `\n<i>…и ещё ${servers.length - 12}</i>` : ''),
+        Markup.inlineKeyboard([
+            [btn('🔄 Обновить', 'adm:proxy')],
+            [btn('⬅️ Назад', 'adm:open')],
+        ])
+    );
+});
+
+// =====================================================================
 // 13. GRACEFUL SHUTDOWN
 // =====================================================================
 
@@ -4674,6 +5352,9 @@ async function shutdown(signal) {
     if (shuttingDown) return;
     shuttingDown = true;
     log.info(`Received ${signal}. Stopping running servers…`);
+    // Сначала останавливаем прокси — чтобы новые игроки не видели серверы
+    // в процессе остановки.
+    try { if (MC_PROXY) await MC_PROXY.stop(); } catch {}
     for (const [, st] of RUNNING) {
         try { st.child.stdin.write('stop\n'); } catch {}
     }
@@ -4707,6 +5388,8 @@ bot.launch().then(async () => {
         log.warn('   Установите OpenJDK 8 (для Forge 1.12.2), 17 и 21 — или укажите JAVA_BIN в .env');
     }
     log.info('   javac:', ENV.JAVAC_BIN || '<not found>');
+    // ─── ЗАПУСК MC REVERSE-PROXY ───
+    await startMcProxy();
     // ─── АВТОУСТАНОВКА ВСЕГО НУЖНОГО ПРИ СТАРТЕ (в фоне) ───
     // 1) Базовые OS-утилиты (unzip / tar / curl / wget / gpg)
     ensureSystemTools().catch((e) => log.warn('ensureSystemTools error:', e.message));

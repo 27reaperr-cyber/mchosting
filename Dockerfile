@@ -41,9 +41,6 @@ RUN apt-get update -qq && \
 
 # ─────────────────────────────────────────────────────────────────────
 # Install Temurin 8 + 17 side-by-side under /opt/java/temurin-{8,17}
-# Adoptium provides static tarballs that work on every glibc-based distro.
-# This avoids the "openjdk-8-jre-headless: no installation candidate"
-# problem on Ubuntu 22.04 (jammy), where OpenJDK 8 was dropped.
 # ─────────────────────────────────────────────────────────────────────
 ARG TARGETARCH
 RUN set -eux; \
@@ -53,14 +50,12 @@ RUN set -eux; \
         *)     ARCH=x64 ;; \
     esac; \
     mkdir -p /opt/java; \
-    # Java 8  (Temurin 8u422)
     curl -fsSL -o /tmp/jdk8.tar.gz \
         "https://api.adoptium.net/v3/binary/latest/8/ga/linux/${ARCH}/jdk/hotspot/normal/eclipse?project=jdk"; \
     mkdir -p /opt/java/temurin-8; \
     tar -xzf /tmp/jdk8.tar.gz -C /opt/java/temurin-8 --strip-components=1; \
     rm -f /tmp/jdk8.tar.gz; \
     /opt/java/temurin-8/bin/java -version; \
-    # Java 17 (Temurin 17 LTS)
     curl -fsSL -o /tmp/jdk17.tar.gz \
         "https://api.adoptium.net/v3/binary/latest/17/ga/linux/${ARCH}/jdk/hotspot/normal/eclipse?project=jdk"; \
     mkdir -p /opt/java/temurin-17; \
@@ -68,8 +63,6 @@ RUN set -eux; \
     rm -f /tmp/jdk17.tar.gz; \
     /opt/java/temurin-17/bin/java -version
 
-# Register every JDK with `update-alternatives` so `which java` works
-# AND so the bot's /usr/lib/jvm/* scan picks them all up.
 RUN mkdir -p /usr/lib/jvm && \
     ln -sfn /opt/java/temurin-8  /usr/lib/jvm/temurin-8-jdk && \
     ln -sfn /opt/java/temurin-17 /usr/lib/jvm/temurin-17-jdk && \
@@ -83,7 +76,6 @@ RUN mkdir -p /usr/lib/jvm && \
     update-alternatives --set java  /opt/java/openjdk/bin/java && \
     update-alternatives --set javac /opt/java/openjdk/bin/javac
 
-# Sanity-check all three JDKs at build time.
 RUN /opt/java/temurin-8/bin/java -version && \
     /opt/java/temurin-17/bin/java -version && \
     java -version && javac -version && jar --version
@@ -95,13 +87,13 @@ COPY --from=builder /app/node_modules ./node_modules
 
 # Copy application
 COPY bot.js ./
+COPY mcproxy.js ./
 
 # Persistent data directories
 RUN mkdir -p /data/servers /data/db
 
 # ─────────────────────────────────────────────────────────────────────
 # Environment defaults — override via your hosting panel.
-# DO NOT create a .env file; all vars come from the host environment.
 # ─────────────────────────────────────────────────────────────────────
 ENV NODE_ENV=production \
     SERVERS_ROOT=/data/servers \
@@ -112,15 +104,24 @@ ENV NODE_ENV=production \
     JVM_XMS=512M \
     JVM_XMX=1G \
     MAX_UPLOAD_MB=50 \
-    PORT_RANGE_MIN=25600 \
-    PORT_RANGE_MAX=26600 \
+    # ─── ВНУТРЕННИЙ диапазон портов для MC-серверов ───
+    # Эти порты НЕ публикуются наружу. Все клиенты подключаются через
+    # единственный публичный PROXY_PORT, который роутит трафик на нужный
+    # внутренний порт по hostname из handshake-пакета MC-протокола.
+    PORT_RANGE_MIN=25700 \
+    PORT_RANGE_MAX=26700 \
     ALLOW_SUDO_INSTALL=1 \
-    BIND_HOST=
-
-# ── BIND_HOST ──
-# Пустая строка = будет записано `server-ip=` (эквивалентно 0.0.0.0) — MC-сервер
-# будет слушать все интерфейсы, включая публичный. НЕ меняйте без необходимости!
-# Если поставить 127.0.0.1 — клиенты извне НЕ смогут подключиться.
+    # ─── РЕВЕРС-ПРОКСИ (handshake router) ───
+    # Один порт на сотни серверов: игроки подключаются к
+    #   <subdomain>.<PROXY_DOMAIN>:<PROXY_PORT>
+    # Бот вытаскивает subdomain из Minecraft-handshake и проксирует
+    # на 127.0.0.1:<внутренний-порт>.
+    PROXY_ENABLED=1 \
+    PROXY_DOMAIN=mchost.bothost.tech \
+    PROXY_PORT=25600 \
+    PROXY_HOST=0.0.0.0 \
+    # При включённом прокси MC-серверы слушают только локально (изоляция).
+    BIND_HOST=127.0.0.1
 
 # Required env vars (set in hosting panel, NOT in a file):
 #   BOT_TOKEN        — Telegram bot token
@@ -129,41 +130,37 @@ ENV NODE_ENV=production \
 # Optional:
 #   ONLYSQ_BASE_URL, ONLYSQ_DEFAULT_MODEL, JVM_XMS, JVM_XMX, MAX_UPLOAD_MB,
 #   PORT_RANGE_MIN, PORT_RANGE_MAX,
+#   PROXY_ENABLED (1/0), PROXY_DOMAIN, PROXY_PORT, PROXY_HOST,
 #   PUBLIC_IP        — force-override публичного IP (полезно за NAT/CGNAT)
-#   BIND_HOST        — интерфейс, на котором слушает MC-сервер (пустое = 0.0.0.0)
+#   BIND_HOST        — интерфейс, на котором слушает MC-сервер
 
 VOLUME ["/data/servers", "/data/db"]
 
 # ──────────────────────────────────────────────────────────────────
 # PORT EXPOSURE
 # ──────────────────────────────────────────────────────────────────
-# EXPOSE — это ТОЛЬКО декларация. Docker всё равно не публикует порты автоматически.
+# С реверс-прокси нужен ТОЛЬКО ОДИН публичный порт — PROXY_PORT (25600).
+# Все остальные TCP-соединения роутятся внутри контейнера через 127.0.0.1
+# и наружу не торчат — это и есть решение проблемы «хостинг блочит порты».
 #
-# Чтобы игроки извне могли подключиться, ОБЯЗАТЕЛЬНО запускайте контейнер с публикацией
-# всего диапазона (либо в панели хостинга, либо вручную):
+# DNS-требования:
+#   *.mchost.bothost.tech  A  <IP контейнера/хоста>
+#   mchost.bothost.tech    A  <IP контейнера/хоста>
+# (wildcard-A-запись; настраивается у DNS-провайдера за 1 минуту)
 #
-#   docker run -d --name mc-tg-bot \\
-#       -e BOT_TOKEN=... -e ADMIN_ID=... -e ONLYSQ_API_KEY=... \\
-#       -e PUBLIC_IP=<ваш IP или домен> \\
-#       -p 25600-26600:25600-26600/tcp \\
-#       -p 25600-26600:25600-26600/udp \\
-#       -v mc-data:/data \\
+# Запуск контейнера:
+#   docker run -d --name mc-tg-bot \
+#       -e BOT_TOKEN=... -e ADMIN_ID=... -e ONLYSQ_API_KEY=... \
+#       -e PROXY_DOMAIN=mchost.bothost.tech \
+#       -e PROXY_PORT=25600 \
+#       -p 25600:25600/tcp \
+#       -v mc-data:/data \
 #       <image>
 #
-# Или docker-compose:
-#   services:
-#     mcbot:
-#       network_mode: host           # простой вариант: порты видны напрямую
-#       ————— или —————
-#       ports:
-#         - "25600-26600:25600-26600/tcp"
-#         - "25600-26600:25600-26600/udp"
+# На VPS откройте только этот ОДИН порт:
+#   sudo ufw allow 25600/tcp
 #
-# ДОПОЛНИТЕЛЬНО на самом VPS: откройте диапазон в ufw/iptables/firewalld/панели:
-#   sudo ufw allow 25600:26600/tcp
-#   sudo ufw allow 25600:26600/udp
-#
-EXPOSE 25600-26600/tcp 25600-26600/udp
+EXPOSE 25600/tcp
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \
     CMD node -e "process.exit(0)" || exit 1
