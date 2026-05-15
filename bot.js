@@ -156,17 +156,327 @@ function resolveJavaBin(preferred) {
     return null;
 }
 
+// ---------------------------------------------------------------
+// MULTI-JAVA DETECTION
+// ---------------------------------------------------------------
+// We need different Java versions for different MC/Forge versions:
+//   - MC 1.7.x / 1.8.x / 1.12.2 / 1.15 / 1.16 (legacy Forge) → Java 8
+//   - MC 1.16.5 (модерн)                                      → Java 11
+//   - MC 1.17 .. 1.20.4                                       → Java 17
+//   - MC 1.20.5+                                              → Java 21
+//
+// ENV.JAVA_INSTALLS — массив { bin, major, version } всех найденных JDK/JRE.
+// ENV.JAVA_BIN остаётся «дефолтным» (новейший доступный) для совместимости.
+// ---------------------------------------------------------------
+
+function parseJavaMajor(versionStr) {
+    if (!versionStr) return 0;
+    // Примеры: 'openjdk version "1.8.0_391"', 'openjdk version "21.0.2"'
+    const m = versionStr.match(/version\s+"([^"]+)"/);
+    if (!m) return 0;
+    const v = m[1];
+    if (v.startsWith('1.')) return parseInt(v.split('.')[1], 10) || 0;
+    return parseInt(v.split('.')[0], 10) || 0;
+}
+
+function scanAllJavaBinaries() {
+    const found = [];
+    const seen = new Set();
+    const tryAdd = (bin) => {
+        if (!bin || seen.has(bin)) return;
+        seen.add(bin);
+        const r = tryJavaBinary(bin);
+        if (r) {
+            const major = parseJavaMajor(r.version);
+            found.push({ bin: r.bin, major, version: r.version });
+        }
+    };
+    if (ENV.JAVA_BIN) tryAdd(ENV.JAVA_BIN);
+    if (process.env.JAVA_HOME) tryAdd(path.join(process.env.JAVA_HOME, 'bin', 'java'));
+    try {
+        const r = spawnSync(process.platform === 'win32' ? 'where' : 'which', ['java'],
+            { stdio: ['ignore', 'pipe', 'ignore'] });
+        if (r.status === 0) {
+            for (const f of r.stdout.toString().split('\n').map(s => s.trim()).filter(Boolean)) {
+                tryAdd(f);
+            }
+        }
+    } catch { /* ignore */ }
+    for (const p of ['/usr/bin/java', '/usr/local/bin/java', '/opt/java/bin/java']) tryAdd(p);
+    // Глобальный скан /usr/lib/jvm/*/bin/java
+    try {
+        const jvmDir = '/usr/lib/jvm';
+        if (fs.existsSync(jvmDir)) {
+            for (const entry of fs.readdirSync(jvmDir)) {
+                tryAdd(path.join(jvmDir, entry, 'bin', 'java'));
+                tryAdd(path.join(jvmDir, entry, 'jre', 'bin', 'java'));
+            }
+        }
+    } catch { /* ignore */ }
+    // macOS
+    try {
+        const macLib = '/Library/Java/JavaVirtualMachines';
+        if (fs.existsSync(macLib)) {
+            for (const entry of fs.readdirSync(macLib)) {
+                tryAdd(path.join(macLib, entry, 'Contents', 'Home', 'bin', 'java'));
+            }
+        }
+    } catch { /* ignore */ }
+    return found;
+}
+
 (function detectJava() {
-    const found = resolveJavaBin(ENV.JAVA_BIN);
-    if (found) {
-        ENV.JAVA_BIN = found.bin;
+    const installs = scanAllJavaBinaries();
+    ENV.JAVA_INSTALLS = installs;
+    if (installs.length) {
+        // Дефолтным считаем НАИБОЛЕЕ НОВУЮ Java
+        installs.sort((a, b) => b.major - a.major);
+        const best = installs[0];
+        ENV.JAVA_BIN = best.bin;
         ENV.JAVA_AVAILABLE = true;
-        ENV.JAVA_VERSION_STR = found.version;
+        ENV.JAVA_VERSION_STR = best.version;
+        ENV.JAVA_MAJOR = best.major;
     } else {
         ENV.JAVA_AVAILABLE = false;
         ENV.JAVA_VERSION_STR = '';
+        ENV.JAVA_MAJOR = 0;
     }
 })();
+
+/**
+ * По версии Minecraft выбирает РЕКОМЕНДУЕМЫЙ major Java.
+ * Возвращает массив допустимых major (от наиболее предпочтительного).
+ */
+function requiredJavaMajorsForMc(mcVersion, flavor) {
+    const parts = String(mcVersion || '').split('.').map(Number);
+    const minor = parts[1] || 0;
+    const patch = parts[2] || 0;
+    // Для Forge правила СТРОЖЕ — он часто падает на более новой Java:
+    //   1.7.10  → только Java 8
+    //   1.8 .. 1.12.2 → только Java 8
+    //   1.13 .. 1.16.4 → Java 8 предпочтительно (11 допустимо)
+    //   1.16.5 → Java 11 (Java 8 тоже работает)
+    //   1.17 .. 1.18.1 → Java 16/17
+    //   1.18.2 .. 1.20.4 → Java 17
+    //   1.20.5+ → Java 21
+    if (flavor === 'forge') {
+        if (minor <= 12) return [8];
+        if (minor <= 15) return [8, 11];
+        if (minor === 16 && patch < 5) return [8, 11];
+        if (minor === 16) return [11, 8];
+        if (minor === 17) return [17, 16];
+        if (minor <= 19) return [17];
+        if (minor === 20 && patch < 5) return [17];
+        return [21, 17];
+    }
+    // Paper / Spigot / Bukkit
+    if (minor <= 16) return [11, 8, 17];
+    if (minor === 17) return [17, 16, 21];
+    if (minor <= 19) return [17, 21];
+    if (minor === 20 && patch < 5) return [17, 21];
+    return [21, 17];
+}
+
+/**
+ * Выбирает физический путь до java для конкретного MC/flavor.
+ * Возвращает { bin, major, version } или null.
+ */
+function pickJavaForServer(server) {
+    const wanted = requiredJavaMajorsForMc(server.mc_version || server.mcVersion, server.flavor);
+    if (!ENV.JAVA_INSTALLS || !ENV.JAVA_INSTALLS.length) return null;
+    for (const want of wanted) {
+        const m = ENV.JAVA_INSTALLS.find((j) => j.major === want);
+        if (m) return m;
+    }
+    // Допускаем «близкий» вариант: для java-8 запроса берём 11 если есть;
+    // для 17 запроса берём 21 и наоборот.
+    const allMajors = ENV.JAVA_INSTALLS.map((j) => j.major).sort((a, b) => a - b);
+    const want = wanted[0];
+    const nearest = allMajors.reduce((best, cur) =>
+        Math.abs(cur - want) < Math.abs((best ?? 999) - want) ? cur : best, null);
+    return ENV.JAVA_INSTALLS.find((j) => j.major === nearest) || null;
+}
+
+/**
+ * Автоустановка отсутствующей Java. Стратегия:
+ *   1) Если есть apt-get и root — пробуем apt-пакеты (Temurin репо приоритетнее,
+ *      т.к. на Ubuntu 22.04+ нет openjdk-8 в дефолтных репах).
+ *   2) Если apt не сработал — скачиваем статический tarball Adoptium Temurin
+ *      и распаковываем в /opt/java/temurin-<major>. Это работает на любом
+ *      Linux-glibc-хосте без sudo (пишем в /opt — нужны права; иначе ~/.local/java).
+ */
+let _aptUpdated = false;
+async function _aptUpdateOnce(sudo) {
+    if (_aptUpdated) return;
+    try {
+        await runCmdSimple([...sudo, 'apt-get', 'update', '-y'], 60_000);
+        _aptUpdated = true;
+    } catch (e) {
+        log.warn('apt-get update failed:', e.message.slice(0, 200));
+    }
+}
+
+/**
+ * Добавляет официальный Adoptium APT-репозиторий, чтобы можно было ставить
+ * пакеты temurin-{8,11,17,21}-jdk на Ubuntu/Debian, где штатных openjdk-8 нет.
+ */
+async function _ensureAdoptiumRepo(sudo) {
+    const listFile = '/etc/apt/sources.list.d/adoptium.list';
+    if (fs.existsSync(listFile)) return true;
+    try {
+        // Распознаём кодовое имя дистрибутива (jammy, focal, bookworm…)
+        let codename = 'jammy';
+        try {
+            const r = spawnSync('bash', ['-lc', '. /etc/os-release && echo $VERSION_CODENAME'],
+                { stdio: ['ignore', 'pipe', 'ignore'] });
+            const v = (r.stdout || '').toString().trim();
+            if (v) codename = v;
+        } catch {}
+        await runCmdSimple([...sudo, 'bash', '-lc',
+            'install -d -m 0755 /etc/apt/keyrings && ' +
+            'curl -fsSL https://packages.adoptium.net/artifactory/api/gpg/key/public ' +
+            '| gpg --dearmor -o /etc/apt/keyrings/adoptium.gpg'
+        ], 60_000);
+        await runCmdSimple([...sudo, 'bash', '-lc',
+            `echo "deb [signed-by=/etc/apt/keyrings/adoptium.gpg] https://packages.adoptium.net/artifactory/deb ${codename} main" > ${listFile}`
+        ], 15_000);
+        _aptUpdated = false; // нужно обновить индекс
+        await _aptUpdateOnce(sudo);
+        return true;
+    } catch (e) {
+        log.warn('ensureAdoptiumRepo failed:', e.message.slice(0, 200));
+        return false;
+    }
+}
+
+/**
+ * Скачивает Adoptium Temurin tarball и распаковывает в /opt/java/temurin-<major>.
+ * Возвращает путь до bin/java или null.
+ */
+async function _installTemurinTarball(major) {
+    try {
+        const arch = (() => {
+            const a = os.arch();
+            if (a === 'x64' || a === 'amd64') return 'x64';
+            if (a === 'arm64' || a === 'aarch64') return 'aarch64';
+            return 'x64';
+        })();
+        const baseDirCandidates = ['/opt/java', path.join(os.homedir(), '.local', 'java')];
+        let baseDir = null;
+        for (const d of baseDirCandidates) {
+            try { fs.mkdirSync(d, { recursive: true }); fs.accessSync(d, fs.constants.W_OK); baseDir = d; break; }
+            catch {}
+        }
+        if (!baseDir) { log.warn('installTemurinTarball: нет директории с правами записи'); return null; }
+        const installDir = path.join(baseDir, `temurin-${major}`);
+        if (fs.existsSync(path.join(installDir, 'bin', 'java'))) {
+            return path.join(installDir, 'bin', 'java');
+        }
+        await fsp.mkdir(installDir, { recursive: true });
+        const url = `https://api.adoptium.net/v3/binary/latest/${major}/ga/linux/${arch}/jdk/hotspot/normal/eclipse?project=jdk`;
+        const tarPath = path.join(os.tmpdir(), `jdk-${major}-${Date.now()}.tar.gz`);
+        log.info(`installTemurinTarball: качаю Temurin ${major} (${arch})…`);
+        await downloadToFile(url, tarPath);
+        await runCmdSimple(['tar', '-xzf', tarPath, '-C', installDir, '--strip-components=1'], 180_000);
+        try { fs.unlinkSync(tarPath); } catch {}
+        const javaBin = path.join(installDir, 'bin', 'java');
+        if (fs.existsSync(javaBin)) {
+            log.info(`installTemurinTarball: Java ${major} установлена в ${installDir}`);
+            return javaBin;
+        }
+        return null;
+    } catch (e) {
+        log.warn(`installTemurinTarball(${major}) failed:`, e.message.slice(0, 200));
+        return null;
+    }
+}
+
+async function autoInstallJava(major) {
+    if (process.platform !== 'linux') return null;
+    // Проверяем привилегии
+    const isRoot = typeof process.getuid === 'function' ? process.getuid() === 0 : false;
+    const canSudo = isRoot || !!process.env.ALLOW_SUDO_INSTALL;
+    const sudo = isRoot ? [] : ['sudo', '-n'];
+
+    log.info(`autoInstallJava: устанавливаю Java ${major}…`);
+
+    // ──── ВЕТКА 1: apt-get (Temurin репо приоритетнее) ────
+    if (canSudo && fs.existsSync('/usr/bin/apt-get')) {
+        await _aptUpdateOnce(sudo);
+        // Сначала пробуем Adoptium Temurin (более стабильно, особенно для Java 8 на jammy)
+        await _ensureAdoptiumRepo(sudo);
+        const candidatesApt = [
+            `temurin-${major}-jdk`,
+            `openjdk-${major}-jdk-headless`,
+            `openjdk-${major}-jdk`,
+            `openjdk-${major}-jre-headless`,
+            `openjdk-${major}-jre`,
+        ];
+        for (const pkg of candidatesApt) {
+            try {
+                await runCmdSimple([...sudo, 'apt-get', 'install', '-y', '--no-install-recommends', pkg], 300_000);
+                log.info(`autoInstallJava: установлен пакет ${pkg}`);
+                ENV.JAVA_INSTALLS = scanAllJavaBinaries();
+                const m = (ENV.JAVA_INSTALLS || []).find((j) => j.major === major);
+                if (m) return m;
+                break;
+            } catch (e) {
+                log.warn(`apt install ${pkg} не удался: ${e.message.slice(0, 200)}`);
+            }
+        }
+    } else {
+        log.warn(`autoInstallJava: нет apt-get или прав sudo — пропускаем apt-ветку`);
+    }
+
+    // ──── ВЕТКА 2: Прямой tarball Adoptium ────
+    const javaBin = await _installTemurinTarball(major);
+    if (javaBin) {
+        // Пересканируем и регистрируем
+        ENV.JAVA_INSTALLS = scanAllJavaBinaries();
+        // На случай если scan ещё не подхватил — добавим вручную:
+        if (!ENV.JAVA_INSTALLS.find((j) => j.bin === javaBin)) {
+            const info = tryJavaBinary(javaBin);
+            if (info) ENV.JAVA_INSTALLS.push({ bin: info.bin, major, version: info.version });
+        }
+        const match = ENV.JAVA_INSTALLS.find((j) => j.major === major);
+        if (match) return match;
+    }
+
+    return null;
+}
+
+/** Простой запуск команды с таймаутом — используется до объявления runCmd. */
+function runCmdSimple(argv, timeoutMs = 60_000) {
+    return new Promise((resolve, reject) => {
+        const [cmd, ...args] = argv;
+        const p = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+        let err = '', out = '';
+        const to = setTimeout(() => { try { p.kill('SIGKILL'); } catch {} reject(new Error('timeout')); }, timeoutMs);
+        p.stdout.on('data', (d) => (out += d.toString()));
+        p.stderr.on('data', (d) => (err += d.toString()));
+        p.on('error', (e) => { clearTimeout(to); reject(e); });
+        p.on('close', (code) => {
+            clearTimeout(to);
+            if (code === 0) resolve(out);
+            else reject(new Error(`${cmd} exit ${code}: ${(err || out).slice(0, 200)}`));
+        });
+    });
+}
+
+/**
+ * Гарантирует доступность java нужного major; если не найдено — пробует поставить.
+ * Возвращает { bin, major, version } или null.
+ */
+async function ensureJavaForServer(server) {
+    let pick = pickJavaForServer(server);
+    if (pick) return pick;
+    const wanted = requiredJavaMajorsForMc(server.mc_version || server.mcVersion, server.flavor);
+    for (const major of wanted) {
+        const inst = await autoInstallJava(major);
+        if (inst) return inst;
+    }
+    return pickJavaForServer(server); // последняя попытка (если apt-get что-то поставил)
+}
 
 // Also try to locate `javac` (used by the AI-plugin generator for compilation)
 function resolveJavacBin() {
@@ -198,6 +508,238 @@ function resolveJavacBin() {
     return null;
 }
 ENV.JAVAC_BIN = resolveJavacBin();
+
+/**
+ * Гарантирует наличие JDK (javac + jar) для компиляции плагинов.
+ * Если javac нет — автоматически пытается установить openjdk-17-jdk (или 21).
+ * Работает только на Linux под root (или с ALLOW_SUDO_INSTALL).
+ */
+async function ensureJavacAvailable() {
+    if (ENV.JAVAC_BIN) return ENV.JAVAC_BIN;
+    if (process.platform !== 'linux') return null;
+    log.info('ensureJavacAvailable: устанавливаю JDK для компиляции плагинов…');
+    // Пробуем версии 21 → 17 — используем общий autoInstallJava
+    // (он уже умеет apt + Adoptium tarball fallback).
+    for (const major of [21, 17]) {
+        const inst = await autoInstallJava(major);
+        if (inst) {
+            ENV.JAVAC_BIN = resolveJavacBin();
+            if (ENV.JAVAC_BIN) {
+                log.info('ensureJavacAvailable: javac найден →', ENV.JAVAC_BIN);
+                return ENV.JAVAC_BIN;
+            }
+            // Сиблинг javac рядом с java
+            const sibling = path.join(path.dirname(inst.bin), 'javac');
+            if (fs.existsSync(sibling)) {
+                ENV.JAVAC_BIN = sibling;
+                log.info('ensureJavacAvailable: javac найден (sibling) →', sibling);
+                return sibling;
+            }
+        }
+    }
+    return ENV.JAVAC_BIN || null;
+}
+
+/**
+ * При старте ставит все нужные Java-версии (8/17/21), если их нет. Идёт в фоне,
+ * выводит прогресс в лог. Результат попадает в ENV.JAVA_INSTALLS.
+ */
+async function ensureAllJavaVersions() {
+    if (process.platform !== 'linux') return;
+    const wanted = [8, 17, 21];
+    const have = new Set((ENV.JAVA_INSTALLS || []).map((j) => j.major));
+    const todo = wanted.filter((m) => !have.has(m));
+    if (!todo.length) {
+        log.info('ensureAllJavaVersions: все Java-версии уже установлены:', [...have].sort().join(', '));
+        return;
+    }
+    log.info('ensureAllJavaVersions: буду установлены:', todo.join(', '));
+    for (const major of todo) {
+        try {
+            const inst = await autoInstallJava(major);
+            if (inst) log.info(`ensureAllJavaVersions: ✅ Java ${major} установлена`);
+            else      log.warn(`ensureAllJavaVersions: ⚠️ Java ${major} не удалось установить`);
+        } catch (e) {
+            log.warn(`ensureAllJavaVersions(${major}) error:`, e.message.slice(0, 200));
+        }
+    }
+    // Обновляем дефолт (наиболее новая Java)
+    const all = ENV.JAVA_INSTALLS || [];
+    if (all.length) {
+        all.sort((a, b) => b.major - a.major);
+        ENV.JAVA_BIN = all[0].bin;
+        ENV.JAVA_AVAILABLE = true;
+        ENV.JAVA_VERSION_STR = all[0].version;
+        ENV.JAVA_MAJOR = all[0].major;
+        if (!ENV.JAVAC_BIN) ENV.JAVAC_BIN = resolveJavacBin();
+    }
+}
+
+/**
+ * Устанавливает базовые OS-утилиты (unzip/tar/curl/wget/file), если их нет.
+ * Без этих инструментов распаковка архивов / Forge-инсталлер / загрузка будут падать.
+ */
+async function ensureSystemTools() {
+    if (process.platform !== 'linux') return;
+    const isRoot = typeof process.getuid === 'function' ? process.getuid() === 0 : false;
+    const canSudo = isRoot || !!process.env.ALLOW_SUDO_INSTALL;
+    if (!canSudo || !fs.existsSync('/usr/bin/apt-get')) return;
+    const sudo = isRoot ? [] : ['sudo', '-n'];
+    const need = [];
+    const tools = [
+        { bin: 'unzip', pkg: 'unzip' },
+        { bin: 'tar',   pkg: 'tar' },
+        { bin: 'curl',  pkg: 'curl' },
+        { bin: 'wget',  pkg: 'wget' },
+        { bin: 'gpg',   pkg: 'gnupg' },
+    ];
+    for (const t of tools) {
+        try {
+            const r = spawnSync('which', [t.bin], { stdio: ['ignore', 'pipe', 'ignore'] });
+            if (r.status !== 0) need.push(t.pkg);
+        } catch { need.push(t.pkg); }
+    }
+    if (!need.length) return;
+    log.info('ensureSystemTools: ставлю:', need.join(', '));
+    await _aptUpdateOnce(sudo);
+    try {
+        await runCmdSimple([...sudo, 'apt-get', 'install', '-y', '--no-install-recommends', ...need], 180_000);
+    } catch (e) {
+        log.warn('ensureSystemTools: apt-get install failed:', e.message.slice(0, 200));
+    }
+}
+
+// =====================================================================
+// PREMIUM EMOJI MAP (из списка пользователя)
+// Используется:
+//   - pe(emoji) → <tg-emoji emoji-id="...">emoji</tg-emoji> для сообщений (HTML)
+//   - btn(text, cb, emoji) → InlineKeyboardButton с icon_custom_emoji_id
+// =====================================================================
+const PREMIUM_EMOJI = {
+    '⚙️': '5870982283724328568', '⚙': '5870982283724328568',
+    '👤': '5870994129244131212',
+    '👥': '5870772616305839506',
+    '👤✅': '5891207662678317861',
+    '👤❌': '5893192487324880883',
+    '📁': '5870528606328852614',
+    '🙂': '5870764288364252592',
+    '📈': '5870930636742595124',
+    '📊': '5870921681735781843',
+    '🏘': '5873147866364514353', '🏘️': '5873147866364514353',
+    '🔒': '6037249452824072506',
+    '🔓': '6037496202990194718',
+    '📣': '6039422865189638057',
+    '✅': '5870633910337015697',
+    '❌': '5870657884844462243',
+    '✖️': '5870657884844462243', '✖': '5870657884844462243',
+    '🖋': '5870676941614354370', '🖋️': '5870676941614354370',
+    '🗑': '5870875489362513438', '🗑️': '5870875489362513438',
+    '📰': '5893057118545646106',
+    '📎': '6039451237743595514',
+    '🔗': '5769289093221454192',
+    'ℹ️': '6028435952299413210', 'ℹ': '6028435952299413210',
+    '🤖': '6030400221232501136',
+    '👁': '6037397706505195857', '👁️': '6037397706505195857',
+    '⬆️': '5963103826075456248', '⬆': '5963103826075456248',
+    '⬇️': '6039802767931871481', '⬇': '6039802767931871481',
+    '🔔': '6039486778597970865',
+    '🎁': '6032644646587338669',
+    '⏰': '5983150113483134607',
+    '🎉': '6041731551845159060',
+    '✍️': '5870753782874246579', '✍': '5870753782874246579',
+    '🖼': '6035128606563241721', '🖼️': '6035128606563241721',
+    '📍': '6042011682497106307',
+    '👛': '5769126056262898415',
+    '📦': '5884479287171485878',
+    '👾': '5260752406890711732',
+    '📅': '5890937706803894250',
+    '🏷': '5886285355279193209', '🏷️': '5886285355279193209',
+    '🕓': '5775896410780079073',
+    '📦📱': '5778672437122045013',
+    '🖌': '6050679691004612757', '🖌️': '6050679691004612757',
+    '🔡': '5771851822897566479',
+    '↔️': '5778479949572738874', '↔': '5778479949572738874',
+    '🪙': '5904462880941545555',
+    '🪙⬆': '5890848474563352982',
+    '🏧': '5879814368572478751',
+    '🔨': '5940433880585605708',
+    '🔄': '5345906554510012647',
+    '◁': '5773130869376315812',
+    // Дополнительные соответствия (берём ближайшие):
+    '⚠️': '5870982283724328568', '⚠': '5870982283724328568',  // warning → settings gear
+    '🔥': '6041731551845159060',  // fire → ура
+    '🚀': '5963103826075456248',  // rocket → отправить
+    '📜': '5870528606328852614',  // scroll → файл
+    '📝': '5870676941614354370',  // memo → карандаш
+    '💬': '5893057118545646106',
+    '🌐': '5769289093221454192',  // глобус → ссылка
+    '▶️': '5963103826075456248', '▶': '5963103826075456248',
+    '🛑': '5870657884844462243',  // stop → крестик
+    '🖥': '5870982283724328568', '🖥️': '5870982283724328568',
+    '✨': '6041731551845159060',
+    '🆕': '5870676941614354370',  // NEW → карандаш
+    '➡️': '5963103826075456248', '➡': '5963103826075456248',
+    '⬅️': '5773130869376315812', '⬅': '5773130869376315812',
+    '⚛️': '5870982283724328568', '⚛': '5870982283724328568', '⛙': '5870982283724328568', '⛙️': '5870982283724328568',
+    '🧠': '5870921681735781843',  // мозг → статистика
+    '➕': '5870633910337015697',
+    '➖': '5870657884844462243',
+};
+
+function emojiId(emoji) {
+    if (!emoji) return null;
+    // Прямое совпадение
+    if (PREMIUM_EMOJI[emoji]) return PREMIUM_EMOJI[emoji];
+    // Без variation selector
+    const stripped = emoji.replace(/\uFE0F/g, '');
+    if (PREMIUM_EMOJI[stripped]) return PREMIUM_EMOJI[stripped];
+    return null;
+}
+
+/** Premium emoji wrapper для HTML-сообщений. pe('✅') → '<tg-emoji ...>✅</tg-emoji>'. */
+function pe(emoji) {
+    const id = emojiId(emoji);
+    if (!id) return emoji;
+    return `<tg-emoji emoji-id="${id}">${emoji}</tg-emoji>`;
+}
+
+/**
+ * Inline-кнопка с премиум-эмодзи. Любые обычные эмодзи в начале text сбрасываются,
+ * вместо них пробрасывается поле icon_custom_emoji_id.
+ */
+function btn(rawText, callbackData) {
+    // Вырезаем ведущий эмодзи + возможные variation-selectorы
+    const m = String(rawText).match(/^(\s*)([\p{Extended_Pictographic}\u2190-\u21FF\u2600-\u27BF][\p{Extended_Pictographic}\uFE0F\u200D]*)\s*(.*)$/u);
+    let cleanText = rawText;
+    let emoji = null;
+    if (m) {
+        emoji = m[2];
+        cleanText = m[3] || rawText;
+    }
+    const id = emoji ? emojiId(emoji) : null;
+    const out = { text: cleanText.trim() || rawText, callback_data: callbackData };
+    if (id) out.icon_custom_emoji_id = id;
+    return out;
+}
+
+/** Обёртка для инлайн-клавиатуры, работает как Markup.inlineKeyboard, но из raw-объектов. */
+function premiumKeyboard(rows) {
+    return { reply_markup: { inline_keyboard: rows } };
+}
+
+/**
+ * url-кнопка с премиум-эмодзи.
+ */
+function btnUrl(rawText, url) {
+    const m = String(rawText).match(/^(\s*)([\p{Extended_Pictographic}\u2190-\u21FF\u2600-\u27BF][\p{Extended_Pictographic}\uFE0F\u200D]*)\s*(.*)$/u);
+    let cleanText = rawText;
+    let emoji = null;
+    if (m) { emoji = m[2]; cleanText = m[3] || rawText; }
+    const id = emoji ? emojiId(emoji) : null;
+    const out = { text: cleanText.trim() || rawText, url };
+    if (id) out.icon_custom_emoji_id = id;
+    return out;
+}
 
 // =====================================================================
 // 1. LOGGER
@@ -679,6 +1221,29 @@ async function urlIsAlive(url) {
 // The result is stored in servers.start_cmd as a JSON-serialised command
 // recipe; startServer() honours it when present.
 // ---------------------------------------------------------------
+/**
+ * Разрешает URL vanilla Minecraft server.jar для любой версии через Mojang
+ * piston-meta. Нужно для legacy Forge (≤1.12.2), чей installer не всегда
+ * скачивает minecraft_server.<ver>.jar сам.
+ */
+async function resolveVanillaServerJarUrl(mcVersion) {
+    try {
+        const idx = 'https://piston-meta.mojang.com/mc/game/version_manifest_v2.json';
+        const r = await request(idx, { headersTimeout: 8000, bodyTimeout: 15000, maxRedirections: 5 });
+        if (r.statusCode !== 200) { r.body.dump?.(); return null; }
+        const json = await r.body.json();
+        const v = (json.versions || []).find((x) => x.id === mcVersion);
+        if (!v) return null;
+        const r2 = await request(v.url, { headersTimeout: 8000, bodyTimeout: 15000, maxRedirections: 5 });
+        if (r2.statusCode !== 200) { r2.body.dump?.(); return null; }
+        const meta = await r2.body.json();
+        return meta?.downloads?.server?.url || null;
+    } catch (e) {
+        log.warn('resolveVanillaServerJarUrl failed:', e.message.slice(0, 200));
+        return null;
+    }
+}
+
 const ForgeAPI = {
     metaUrl: 'https://maven.minecraftforge.net/net/minecraftforge/forge/maven-metadata.xml',
     promoUrl: 'https://files.minecraftforge.net/net/minecraftforge/forge/promotions_slim.json',
@@ -868,29 +1433,61 @@ async function startServer(server, ctx) {
     // has disappeared, re-detect once. If still nothing — bail out with a
     // detailed, actionable message (no more cryptic `ENOENT`).
     if (!ENV.JAVA_AVAILABLE || !ENV.JAVA_BIN || !tryJavaBinary(ENV.JAVA_BIN)) {
-        const redetected = resolveJavaBin(ENV.JAVA_BIN);
-        if (redetected) {
-            ENV.JAVA_BIN = redetected.bin;
+        // Пересканируем все Java-инсталляции
+        ENV.JAVA_INSTALLS = scanAllJavaBinaries();
+        if (ENV.JAVA_INSTALLS.length) {
+            const best = ENV.JAVA_INSTALLS.sort((a, b) => b.major - a.major)[0];
+            ENV.JAVA_BIN = best.bin;
             ENV.JAVA_AVAILABLE = true;
-            ENV.JAVA_VERSION_STR = redetected.version;
+            ENV.JAVA_VERSION_STR = best.version;
+            ENV.JAVA_MAJOR = best.major;
             log.info('Java re-detected at runtime:', ENV.JAVA_BIN);
         } else {
             ENV.JAVA_AVAILABLE = false;
             await ctx.reply(
-                '<tg-emoji emoji-id="5870657884844462243">❌</tg-emoji> <b>Java не найдена на этом хосте.</b>\n\n' +
+                `${pe('❌')} <b>Java не найдена на этом хосте.</b>\n\n` +
                 'Бот не может запустить Minecraft-сервер, потому что в системе ' +
                 'отсутствует исполняемый файл <code>java</code>.\n\n' +
                 '<b>Что сделать:</b>\n' +
-                '• Ubuntu/Debian: <code>sudo apt update &amp;&amp; sudo apt install -y openjdk-21-jre-headless</code>\n' +
-                '• Alpine: <code>apk add openjdk21-jre</code>\n' +
-                '• Docker: используйте базовый образ <code>eclipse-temurin:21-jre</code>\n\n' +
-                '<tg-emoji emoji-id="6028435952299413210">ℹ</tg-emoji> Укажите переменную окружения <code>JAVA_BIN=/usr/bin/java</code>\n' +
-                'или экспортируйте <code>JAVA_HOME</code> и перезапустите бота.',
+                '• Ubuntu/Debian: <code>sudo apt update &amp;&amp; sudo apt install -y openjdk-21-jre-headless openjdk-8-jre-headless</code>\n' +
+                '• Alpine: <code>apk add openjdk21-jre openjdk8-jre</code>\n' +
+                '• Docker: <code>eclipse-temurin:21-jre</code> + доп. JDK 8/11/17 для Forge\n\n' +
+                `${pe('ℹ')} Переменная <code>JAVA_BIN=/usr/bin/java</code> или <code>JAVA_HOME</code>, затем перезапуск.`,
                 { parse_mode: 'HTML' }
             ).catch(() => {});
             return;
         }
     }
+
+    // ВЫБИРАЕМ ПОДХОДЯЩУЮ версию Java для этого MC/flavor.
+    // Это исправляет «ClassCastException AppClassLoader → URLClassLoader» на Forge 1.12.2
+    // при запуске под Java 16+ — форж 1.12 требует Java 8.
+    let serverJava = pickJavaForServer(server);
+    if (!serverJava) {
+        // Пытаемся автоустановить нужную Java через apt-get
+        const wanted = requiredJavaMajorsForMc(server.mc_version, server.flavor);
+        await ctx.reply(
+            `${pe('⚙️')} Для <b>${esc(server.flavor)} ${esc(server.mc_version)}</b> нужна Java <b>${wanted[0]}</b>.\n` +
+            `Пробую установить автоматически…`,
+            { parse_mode: 'HTML' }
+        ).catch(() => {});
+        serverJava = await ensureJavaForServer(server);
+    }
+    if (!serverJava) {
+        const wanted = requiredJavaMajorsForMc(server.mc_version, server.flavor);
+        const have = (ENV.JAVA_INSTALLS || []).map((j) => `Java ${j.major}`).join(', ') || 'ничего';
+        await ctx.reply(
+            `${pe('❌')} <b>Несовместимая версия Java.</b>\n\n` +
+            `Для <b>${esc(server.flavor)} ${esc(server.mc_version)}</b> рекомендуется <b>Java ${wanted[0]}</b>.\n` +
+            `Сейчас в системе: ${esc(have)}.\n\n` +
+            `<b>Установите нужную Java:</b>\n` +
+            `• <code>sudo apt install -y openjdk-${wanted[0]}-jre-headless</code>\n` +
+            `• Или вручную: скачайте Adoptium Temurin ${wanted[0]} и укажите путь.`,
+            { parse_mode: 'HTML' }
+        ).catch(() => {});
+        return;
+    }
+    log.info(`Server #${server.id} (${server.flavor} ${server.mc_version}) → Java ${serverJava.major} @ ${serverJava.bin}`);
 
     await fsp.writeFile(path.join(server.dir, 'eula.txt'), 'eula=true\n');
 
@@ -900,7 +1497,34 @@ async function startServer(server, ctx) {
     let recipe = null;
     try { recipe = server.start_cmd ? JSON.parse(server.start_cmd) : null; } catch { recipe = null; }
 
-    if (recipe && recipe.mode === 'forge-args' && recipe.argsFile) {
+    // The actual executable we'll spawn (java by default — but run.sh for modern Forge).
+    // ИСПОЛЬЗУЕМ выбранный по MC-версии serverJava, А НЕ глобальный ENV.JAVA_BIN.
+    const javaBinForRun = serverJava.bin;
+    const javaMajorForRun = serverJava.major;
+    let execBin = javaBinForRun;
+    let spawnEnv = process.env;
+
+    if (recipe && recipe.mode === 'forge-runsh' && recipe.script) {
+        // Modern Forge: delegate to the installer-generated run.sh. It already
+        // wires up @user_jvm_args.txt + @libraries/.../unix_args.txt with the right
+        // module/path flags. We pass JAVA_HOME so run.sh picks up our managed java.
+        const scriptPath = path.join(server.dir, recipe.script);
+        if (!fs.existsSync(scriptPath)) {
+            await ctx.reply(
+                `${pe('❌')} Не найден файл запуска Forge: <code>${esc(recipe.script)}</code>\n` +
+                `Попробуйте переустановить сервер.`,
+                { parse_mode: 'HTML' }
+            ).catch(() => {});
+            return;
+        }
+        // Ensure +x (Docker volume mounts often strip it).
+        try { await fsp.chmod(scriptPath, 0o755); } catch {}
+        execBin = '/bin/bash';
+        args = [recipe.script, 'nogui'];
+        // Point JAVA_HOME at the JDK соответствующей версии, чтобы run.sh использовал именно её
+        const javaHome = path.dirname(path.dirname(javaBinForRun));
+        spawnEnv = { ...process.env, JAVA_HOME: javaHome, PATH: `${path.dirname(javaBinForRun)}:${process.env.PATH || ''}` };
+    } else if (recipe && recipe.mode === 'forge-args' && recipe.argsFile) {
         const argsPath = path.join(server.dir, recipe.argsFile);
         if (!fs.existsSync(argsPath)) {
             await ctx.reply(
@@ -910,10 +1534,32 @@ async function startServer(server, ctx) {
             ).catch(() => {});
             return;
         }
+        // Make sure user_jvm_args.txt exists with our heap settings — modern Forge
+        // expects it; without it ModLauncher boots but the Minecraft server never
+        // gets enough heap and silently dies right after "Launching target 'forge_server'".
+        const userArgsPath = path.join(server.dir, 'user_jvm_args.txt');
+        const heapBlock =
+            '# Auto-generated by mc-tg-bot — JVM heap & GC\n' +
+            `-Xms${ENV.JVM_XMS}\n` +
+            `-Xmx${ENV.JVM_XMX}\n` +
+            '-XX:+UseG1GC\n';
+        try {
+            if (fs.existsSync(userArgsPath)) {
+                const cur = await fsp.readFile(userArgsPath, 'utf8');
+                // Strip any previous -Xms/-Xmx and re-inject current values.
+                const cleaned = cur
+                    .split('\n')
+                    .filter((l) => !/^\s*-(Xm[sx]|XX:\+UseG1GC)/.test(l))
+                    .join('\n');
+                await fsp.writeFile(userArgsPath, heapBlock + '\n' + cleaned);
+            } else {
+                await fsp.writeFile(userArgsPath, heapBlock);
+            }
+        } catch (e) {
+            log.warn('Failed to write user_jvm_args.txt:', e.message);
+        }
         args = [
-            `-Xms${ENV.JVM_XMS}`,
-            `-Xmx${ENV.JVM_XMX}`,
-            '-XX:+UseG1GC',
+            '@user_jvm_args.txt',
             `@${recipe.argsFile}`,
             'nogui',
         ];
@@ -921,21 +1567,28 @@ async function startServer(server, ctx) {
         const jarRel = recipe?.mode === 'jar' && recipe.jar
             ? recipe.jar
             : path.relative(server.dir, server.jar) || server.jar;
-        args = [
+        // Для Java 8 НЕЛЬЗЯ использовать -XX:+UseG1GC без дополнительных флагов (он работает, но оставим просто),
+        // а для старых Forge под Java 8 нельзя передавать --add-opens/--add-modules.
+        const baseArgs = [
             `-Xms${ENV.JVM_XMS}`,
             `-Xmx${ENV.JVM_XMX}`,
             '-XX:+UseG1GC',
-            '-jar', jarRel,
-            'nogui',
         ];
+        // Для Forge 1.12.2 (Java 8) добавляем flags под LaunchWrapper:
+        if (server.flavor === 'forge' && javaMajorForRun <= 8) {
+            // Старый Forge имеет свой LaunchWrapper main class внутри jar manifest,
+            // никаких дополнительных флагов не нужно.
+        }
+        args = [...baseArgs, '-jar', jarRel, 'nogui'];
     }
-    log.info(`Starting server #${server.id} (${server.flavor} ${server.mc_version}) in ${server.dir} via ${ENV.JAVA_BIN}: ${args.join(' ')}`);
+    log.info(`Starting server #${server.id} (${server.flavor} ${server.mc_version}) via ${execBin} (Java ${javaMajorForRun}): ${args.join(' ')}`);
 
     let child;
     try {
-        child = spawn(ENV.JAVA_BIN, args, {
+        child = spawn(execBin, args, {
             cwd: server.dir,
             stdio: ['pipe', 'pipe', 'pipe'],
+            env: spawnEnv,
         });
     } catch (e) {
         log.error(`spawn() threw synchronously for server #${server.id}:`, e.message);
@@ -954,6 +1607,9 @@ async function startServer(server, ctx) {
         startedAt: Date.now(),
         bootLogForAI: '',
         bootDone: false,
+        stopRequested: false,   // set when /stop is sent via the panel
+        stopReason: null,       // 'user' | 'crash' | 'killed' | …
+        flavor: server.flavor,
     };
     RUNNING.set(server.id, state);
 
@@ -1014,9 +1670,9 @@ async function startServer(server, ctx) {
                         {
                             parse_mode: 'HTML',
                             ...Markup.inlineKeyboard([
-                                [Markup.button.callback('🖥 Консоль',     `srv:console:${server.id}`)],
-                                [Markup.button.callback('📊 Статус',    `srv:status:${server.id}`)],
-                                [Markup.button.callback('⬅️ К серверу', `srv:open:${server.id}`)],
+                                [btn('🖥 Консоль', `srv:console:${server.id}`)],
+                                [btn('📊 Статус', `srv:status:${server.id}`)],
+                                [btn('⬅️ К серверу', `srv:open:${server.id}`)],
                             ]),
                         }
                     ).catch(() => {});
@@ -1044,26 +1700,54 @@ async function startServer(server, ctx) {
         ).catch(() => {});
     });
 
-    child.on('exit', async (code) => {
+    child.on('exit', async (code, signal) => {
         RUNNING.delete(server.id);
         const tail = tailString(state.log.join(''), 3500);
+        const runtimeSec = Math.round((Date.now() - state.startedAt) / 1000);
+
+        // Classify what just happened.
+        let trigger;
+        if (state.stopRequested) trigger = 'user';
+        else if (signal === 'SIGKILL' || signal === 'SIGTERM') trigger = 'killed';
+        else if (code === 0) trigger = 'clean';
+        else trigger = 'crash';
+
+        const headEmoji = trigger === 'crash' ? '💥' : '🛑';
+        const headText  = trigger === 'user'   ? 'остановлен по команде'
+                        : trigger === 'killed' ? `прерван сигналом ${esc(signal || '?')}`
+                        : trigger === 'crash'  ? 'аварийно завершился'
+                        :                         'остановлен';
+
         await ctx.telegram.sendMessage(
             state.chatId,
-            `🛑 Сервер «<b>${esc(server.name)}</b>» остановлен (код ${esc(code)}).`,
+            `${headEmoji} Сервер «<b>${esc(server.name)}</b>» ${headText}` +
+            ` (код ${esc(code ?? '—')}${signal ? `, сигнал ${esc(signal)}` : ''}).\n` +
+            `⏱ Время работы: <b>${runtimeSec}с</b>`,
             { parse_mode: 'HTML' }
         ).catch(() => {});
-        if (code !== 0) {
-            try {
-                const verdict = await aiAnalyseStartup(tail, server);
-                await ctx.telegram.sendMessage(
-                    state.chatId,
-                    `<tg-emoji emoji-id="6030400221232501136">🤖</tg-emoji> <b>AI-разбор завершения сервера:</b>\n${esc(verdict)}`,
-                    { parse_mode: 'HTML' }
-                ).catch(() => {});
-            } catch (e) { log.warn('AI post-mortem failed:', e.message); }
-        }
+
+        // AI post-mortem — ALWAYS run, regardless of exit code, but with a
+        // dedicated "shutdown" prompt that asks the model to explain *why* the
+        // server stopped (not just whether it started).
+        try {
+            const verdict = await aiAnalyseShutdown(tail, server, {
+                exitCode: code,
+                signal,
+                trigger,
+                runtimeSec,
+            });
+            await ctx.telegram.sendMessage(
+                state.chatId,
+                `<tg-emoji emoji-id="6030400221232501136">🤖</tg-emoji> <b>AI: причина остановки сервера:</b>\n${esc(verdict)}`,
+                { parse_mode: 'HTML' }
+            ).catch(() => {});
+        } catch (e) { log.warn('AI post-mortem failed:', e.message); }
     });
 
+    // Forge boots far slower than Paper/Spigot (mod scanning, library extraction,
+    // world gen on first launch). Give it a much larger window before nagging the
+    // user — otherwise the AI verdict fires while the server is still booting.
+    const bootCheckDelayMs = server.flavor === 'forge' ? 90_000 : 25_000;
     setTimeout(async () => {
         const st = RUNNING.get(server.id);
         if (!st || st.bootDone) return;
@@ -1071,11 +1755,11 @@ async function startServer(server, ctx) {
             const verdict = await aiAnalyseStartup(st.bootLogForAI, server);
             ctx.telegram.sendMessage(
                 st.chatId,
-                `<tg-emoji emoji-id="6030400221232501136">🤖</tg-emoji> <b>AI-диагностика запуска (20 сек):</b>\n${esc(verdict)}`,
+                `<tg-emoji emoji-id="6030400221232501136">🤖</tg-emoji> <b>AI-диагностика запуска (${Math.round(bootCheckDelayMs / 1000)} сек):</b>\n${esc(verdict)}`,
                 { parse_mode: 'HTML' }
             ).catch(() => {});
         } catch (e) { log.warn('AI boot-check failed:', e.message); }
-    }, 20_000);
+    }, bootCheckDelayMs);
 
     await ctx.reply(
         `<tg-emoji emoji-id="5963103826075456248">🚀</tg-emoji> Сервер «<b>${esc(server.name)}</b>» запускается…\n` +
@@ -1083,9 +1767,9 @@ async function startServer(server, ctx) {
         {
             parse_mode: 'HTML',
             ...Markup.inlineKeyboard([
-                [Markup.button.callback('📜 Показать лог', `srv:log:${server.id}`)],
-                [Markup.button.callback('🛑 Остановить',   `srv:stop:${server.id}`)],
-                [Markup.button.callback('⬅️ К серверу',    `srv:open:${server.id}`)],
+                [btn('📜 Показать лог', `srv:log:${server.id}`)],
+                [btn('🛑 Остановить', `srv:stop:${server.id}`)],
+                [btn('⬅️ К серверу', `srv:open:${server.id}`)],
             ]),
         }
     ).catch(() => {});
@@ -1094,6 +1778,8 @@ async function startServer(server, ctx) {
 function stopServer(serverId) {
     const st = RUNNING.get(serverId);
     if (!st) return false;
+    st.stopRequested = true;   // tell the exit handler this was user-initiated
+    st.stopReason = 'user';
     try { st.child.stdin.write('stop\n'); } catch {}
     setTimeout(() => {
         if (RUNNING.has(serverId)) {
@@ -1429,6 +2115,52 @@ async function aiAnalyseStartup(logText, server) {
     return await aiChat({ system, user, maxTokens: 600 });
 }
 
+/**
+ * Explain WHY the server stopped. Called from the child.on('exit') handler,
+ * with full context (exit code, signal, whether the user requested the stop,
+ * total uptime). The prompt is intentionally different from aiAnalyseStartup —
+ * we want a post-mortem, not a boot diagnostic.
+ */
+async function aiAnalyseShutdown(logText, server, ctx) {
+    const { exitCode, signal, trigger, runtimeSec } = ctx || {};
+    const triggerHint = {
+        user:   'Пользователь сам нажал «Остановить» в боте (отправлена команда stop).',
+        clean:  'Сервер завершился сам с кодом 0 (вероятно, штатное завершение).',
+        crash:  'Сервер завершился с НЕнулевым кодом — это похоже на падение/ошибку.',
+        killed: 'Процесс был принудительно убит сигналом ОС (SIGTERM/SIGKILL).',
+    }[trigger] || '';
+
+    const system = `Ты — эксперт по администрированию Minecraft-серверов
+(Paper/Spigot/Bukkit/Forge). Сервер только что ОСТАНОВИЛСЯ.
+Твоя задача — на русском, КОРОТКО (3–7 строк), объяснить ПРИЧИНУ остановки.
+
+В ответе обязательно укажи:
+1) Главная причина остановки одной фразой (например: «штатная остановка пользователем»,
+   «OOM — не хватило памяти», «crash из-за плагина X», «не принят EULA», «порт занят»,
+   «несовместимая версия Java», «мод/плагин выбросил исключение в onEnable» и т. п.).
+2) Если это краш — какая конкретно ошибка в логе и как её устранить (1–3 пункта).
+3) Если штатная остановка — просто подтверди это, без выдуманных проблем.
+
+Не выдумывай факты, опирайся только на лог и метаданные.
+Если лог пустой/обрезан — честно скажи «недостаточно данных», и предложи проверить
+logs/latest.log на сервере.
+
+ВАЖНО: пиши ОБЫЧНЫМ ТЕКСТОМ, без какого-либо форматирования.
+НЕ используй Markdown (**жирный**, *курсив*, \`код\`, # заголовки, списки с -/* ),
+НЕ используй HTML-теги (<b>, <i>, <code>, <pre>, …).
+Только чистый текст. Эмодзи допустимы.`;
+
+    const user =
+        `Сервер: ${server.flavor} ${server.mc_version}\n` +
+        `Директория: ${server.dir}\n` +
+        `Время работы до остановки: ${runtimeSec ?? '?'} сек\n` +
+        `Код выхода: ${exitCode ?? '—'}` + (signal ? `, сигнал: ${signal}` : '') + `\n` +
+        `Триггер: ${trigger || 'unknown'} — ${triggerHint}\n\n` +
+        `=== ХВОСТ ЛОГА ===\n${logText || '(пусто)'}`;
+
+    return await aiChat({ system, user, maxTokens: 500 });
+}
+
 async function aiPlanFilePlacement({ filename, kind, server, listing }) {
     const system = `Ты — ассистент по установке файлов на Minecraft-сервер
 (${server.flavor} ${server.mc_version}).
@@ -1581,53 +2313,355 @@ async function aiGeneratePluginOrScript({ prompt, server }) {
  * Requires `javac` and `jar` to be available locally.
  * Returns the path to the produced .jar, or null on failure.
  */
-async function tryCompileJavaPlugin({ javaFile, pluginYmlPath, outDir, pluginName }) {
-    if (!ENV.JAVAC_BIN) return null;
-    const jarBin = (() => {
-        const candidates = [];
-        if (ENV.JAVA_BIN) candidates.push(path.join(path.dirname(ENV.JAVA_BIN), 'jar'));
-        if (process.env.JAVA_HOME) candidates.push(path.join(process.env.JAVA_HOME, 'bin', 'jar'));
-        try {
-            const r = spawnSync(process.platform === 'win32' ? 'where' : 'which', ['jar'],
-                { stdio: ['ignore', 'pipe', 'ignore'] });
-            if (r.status === 0) {
-                for (const f of r.stdout.toString().split('\n').map((s) => s.trim()).filter(Boolean)) {
-                    candidates.push(f);
-                }
+function findJarBin() {
+    const candidates = [];
+    if (ENV.JAVA_BIN) candidates.push(path.join(path.dirname(ENV.JAVA_BIN), 'jar'));
+    if (process.env.JAVA_HOME) candidates.push(path.join(process.env.JAVA_HOME, 'bin', 'jar'));
+    try {
+        const r = spawnSync(process.platform === 'win32' ? 'where' : 'which', ['jar'],
+            { stdio: ['ignore', 'pipe', 'ignore'] });
+        if (r.status === 0) {
+            for (const f of r.stdout.toString().split('\n').map((s) => s.trim()).filter(Boolean)) {
+                candidates.push(f);
             }
-        } catch { /* ignore */ }
-        for (const c of candidates) {
-            try {
-                const r = spawnSync(c, ['--version'], { stdio: ['ignore', 'pipe', 'pipe'] });
-                if (!r.error && (r.status === 0 || r.status === null)) return c;
-            } catch { /* ignore */ }
         }
-        return null;
-    })();
-    if (!jarBin) return null;
+    } catch { /* ignore */ }
+    for (const c of candidates) {
+        try {
+            const r = spawnSync(c, ['--version'], { stdio: ['ignore', 'pipe', 'pipe'] });
+            if (!r.error && (r.status === 0 || r.status === null)) return c;
+        } catch { /* ignore */ }
+    }
+    return null;
+}
+
+/**
+ * Make sure we have a JAR on disk that contains the Bukkit/Spigot/Paper API
+ * classes (org.bukkit.*, etc.), so generated plugins can be compiled against it.
+ *
+ * Strategy:
+ *   1) For Paper: run the paperclip launcher with -Dpaperclip.patchonly=true.
+ *      That extracts versions/<mc>/paper-<mc>.jar — the real patched server
+ *      with all Bukkit API classes exposed. Compilation against THAT jar works.
+ *   2) Fallback for any flavor: download paper-api from repo.papermc.io
+ *      (snapshot metadata → real artifact URL), cached under SERVERS_ROOT/_api_cache.
+ *   3) Last resort: just hand back whatever jars sit next to the server.jar.
+ *
+ * Returns an array of classpath entries (jar paths), or [] if nothing usable.
+ */
+async function ensureBukkitApiJar(server) {
+    const out = [];
+
+    // ---- 1) Paperclip extraction (Paper / Folia / very-modern flavors) ----
+    if (server.flavor === 'paper' || /paper/i.test(path.basename(server.jar || ''))) {
+        const versionsDir = path.join(server.dir, 'versions');
+        try {
+            // If versions/ already has an extracted jar, reuse it.
+            const existing = await findFile(versionsDir, /\.jar$/i, 4);
+            if (existing && fs.existsSync(existing)) out.push(existing);
+        } catch { /* ignore */ }
+
+        if (!out.length && ENV.JAVA_AVAILABLE && server.jar && fs.existsSync(server.jar)) {
+            try {
+                // Подбираем Java по MC-версии и для paperclip-распаковки.
+                const pj = pickJavaForServer(server) || { bin: ENV.JAVA_BIN };
+                log.info(`Paperclip extract for #${server.id}: ${server.jar} (Java ${pj.major || '?'})`);
+                await runCmd(
+                    pj.bin,
+                    ['-Dpaperclip.patchonly=true', '-jar', path.basename(server.jar)],
+                    { cwd: server.dir }
+                );
+                const extracted = await findFile(versionsDir, /\.jar$/i, 4);
+                if (extracted) out.push(extracted);
+            } catch (e) {
+                log.warn('Paperclip extraction failed:', e.message.slice(0, 200));
+            }
+        }
+    }
+
+    // ---- 2) Cached paper-api jar from repo.papermc.io ----
+    if (!out.length) {
+        const cacheDir = path.join(ENV.SERVERS_ROOT, '_api_cache');
+        await fsp.mkdir(cacheDir, { recursive: true });
+        const cached = path.join(cacheDir, `paper-api-${server.mc_version}.jar`);
+        if (fs.existsSync(cached) && (await fsp.stat(cached)).size > 1024) {
+            out.push(cached);
+        } else {
+            try {
+                const metaUrl = `https://repo.papermc.io/repository/maven-public/io/papermc/paper/paper-api/${server.mc_version}-R0.1-SNAPSHOT/maven-metadata.xml`;
+                const res = await request(metaUrl, {
+                    headers: { 'User-Agent': ENV.PAPER_UA, Accept: 'application/xml' },
+                    headersTimeout: 8000,
+                    bodyTimeout: 15000,
+                    maxRedirections: 5,
+                });
+                if (res.statusCode === 200) {
+                    const xml = await res.body.text();
+                    // Extract any <snapshotVersion>…<extension>jar</extension>…<value>X</value> pair.
+                    let value = null;
+                    const blocks = xml.split('<snapshotVersion>');
+                    for (const blk of blocks) {
+                        if (/<extension>jar<\/extension>/i.test(blk) &&
+                            !/<classifier>/i.test(blk)) {
+                            const m = blk.match(/<value>([^<]+)<\/value>/i);
+                            if (m) { value = m[1]; break; }
+                        }
+                    }
+                    if (value) {
+                        const jarUrl = `https://repo.papermc.io/repository/maven-public/io/papermc/paper/paper-api/${server.mc_version}-R0.1-SNAPSHOT/paper-api-${value}.jar`;
+                        log.info(`Downloading paper-api for ${server.mc_version}: ${jarUrl}`);
+                        await downloadToFile(jarUrl, cached);
+                        if ((await fsp.stat(cached)).size > 1024) out.push(cached);
+                    }
+                } else {
+                    res.body.dump?.();
+                }
+            } catch (e) {
+                log.warn('paper-api fetch failed:', e.message.slice(0, 200));
+            }
+        }
+    }
+
+    // ---- 2b) spigot-api fallback (работает для старых версий 1.8–1.16 и по дефолту для Spigot/Bukkit) ----
+    if (!out.length) {
+        const cacheDir = path.join(ENV.SERVERS_ROOT, '_api_cache');
+        await fsp.mkdir(cacheDir, { recursive: true });
+        const cached = path.join(cacheDir, `spigot-api-${server.mc_version}.jar`);
+        if (fs.existsSync(cached) && (await fsp.stat(cached)).size > 1024) {
+            out.push(cached);
+        } else {
+            // hub.spigotmc.org публикует spigot-api по адресу:
+            //   https://hub.spigotmc.org/nexus/content/repositories/snapshots/org/spigotmc/spigot-api/<MC>-R0.1-SNAPSHOT/
+            try {
+                const metaUrl = `https://hub.spigotmc.org/nexus/content/repositories/snapshots/org/spigotmc/spigot-api/${server.mc_version}-R0.1-SNAPSHOT/maven-metadata.xml`;
+                const res = await request(metaUrl, {
+                    headers: { 'User-Agent': ENV.PAPER_UA, Accept: 'application/xml' },
+                    headersTimeout: 8000, bodyTimeout: 15000, maxRedirections: 5,
+                });
+                if (res.statusCode === 200) {
+                    const xml = await res.body.text();
+                    let value = null;
+                    const blocks = xml.split('<snapshotVersion>');
+                    for (const blk of blocks) {
+                        if (/<extension>jar<\/extension>/i.test(blk) && !/<classifier>/i.test(blk)) {
+                            const m = blk.match(/<value>([^<]+)<\/value>/i);
+                            if (m) { value = m[1]; break; }
+                        }
+                    }
+                    if (value) {
+                        const jarUrl = `https://hub.spigotmc.org/nexus/content/repositories/snapshots/org/spigotmc/spigot-api/${server.mc_version}-R0.1-SNAPSHOT/spigot-api-${value}.jar`;
+                        log.info(`Downloading spigot-api for ${server.mc_version}: ${jarUrl}`);
+                        await downloadToFile(jarUrl, cached);
+                        if ((await fsp.stat(cached)).size > 1024) out.push(cached);
+                    }
+                } else {
+                    res.body.dump?.();
+                }
+            } catch (e) {
+                log.warn('spigot-api fetch failed:', e.message.slice(0, 200));
+            }
+        }
+    }
+
+    // ---- 2c) Bukkit API fallback (покрывает самые старые версии — 1.7.10, 1.8.x и т.д.) ----
+    if (!out.length) {
+        const cacheDir = path.join(ENV.SERVERS_ROOT, '_api_cache');
+        await fsp.mkdir(cacheDir, { recursive: true });
+        const cached = path.join(cacheDir, `bukkit-${server.mc_version}.jar`);
+        if (fs.existsSync(cached) && (await fsp.stat(cached)).size > 1024) {
+            out.push(cached);
+        } else {
+            try {
+                const metaUrl = `https://hub.spigotmc.org/nexus/content/repositories/snapshots/org/bukkit/bukkit/${server.mc_version}-R0.1-SNAPSHOT/maven-metadata.xml`;
+                const res = await request(metaUrl, {
+                    headers: { 'User-Agent': ENV.PAPER_UA, Accept: 'application/xml' },
+                    headersTimeout: 8000, bodyTimeout: 15000, maxRedirections: 5,
+                });
+                if (res.statusCode === 200) {
+                    const xml = await res.body.text();
+                    let value = null;
+                    const blocks = xml.split('<snapshotVersion>');
+                    for (const blk of blocks) {
+                        if (/<extension>jar<\/extension>/i.test(blk) && !/<classifier>/i.test(blk)) {
+                            const m = blk.match(/<value>([^<]+)<\/value>/i);
+                            if (m) { value = m[1]; break; }
+                        }
+                    }
+                    if (value) {
+                        const jarUrl = `https://hub.spigotmc.org/nexus/content/repositories/snapshots/org/bukkit/bukkit/${server.mc_version}-R0.1-SNAPSHOT/bukkit-${value}.jar`;
+                        log.info(`Downloading bukkit-api for ${server.mc_version}: ${jarUrl}`);
+                        await downloadToFile(jarUrl, cached);
+                        if ((await fsp.stat(cached)).size > 1024) out.push(cached);
+                    }
+                } else {
+                    res.body.dump?.();
+                }
+            } catch (e) {
+                log.warn('bukkit-api fetch failed:', e.message.slice(0, 200));
+            }
+        }
+    }
+
+    // ---- 2d) Резерв: берём ЛАТЕЙШИЙ paper-api (подходит для компиляции 99% плагинов) ----
+    if (!out.length) {
+        const cacheDir = path.join(ENV.SERVERS_ROOT, '_api_cache');
+        await fsp.mkdir(cacheDir, { recursive: true });
+        const cached = path.join(cacheDir, `paper-api-latest.jar`);
+        if (fs.existsSync(cached) && (await fsp.stat(cached)).size > 1024) {
+            out.push(cached);
+        } else {
+            try {
+                // Находим последнюю версию paper-api в maven-metadata
+                const idx = 'https://repo.papermc.io/repository/maven-public/io/papermc/paper/paper-api/maven-metadata.xml';
+                const res = await request(idx, {
+                    headers: { 'User-Agent': ENV.PAPER_UA, Accept: 'application/xml' },
+                    headersTimeout: 8000, bodyTimeout: 15000, maxRedirections: 5,
+                });
+                if (res.statusCode === 200) {
+                    const xml = await res.body.text();
+                    const m = xml.match(/<latest>([^<]+)<\/latest>/i);
+                    const latest = m ? m[1] : null;
+                    if (latest) {
+                        const metaUrl2 = `https://repo.papermc.io/repository/maven-public/io/papermc/paper/paper-api/${latest}/maven-metadata.xml`;
+                        const r2 = await request(metaUrl2, {
+                            headers: { 'User-Agent': ENV.PAPER_UA, Accept: 'application/xml' },
+                            headersTimeout: 8000, bodyTimeout: 15000, maxRedirections: 5,
+                        });
+                        if (r2.statusCode === 200) {
+                            const xml2 = await r2.body.text();
+                            let value = null;
+                            const blocks = xml2.split('<snapshotVersion>');
+                            for (const blk of blocks) {
+                                if (/<extension>jar<\/extension>/i.test(blk) && !/<classifier>/i.test(blk)) {
+                                    const mm = blk.match(/<value>([^<]+)<\/value>/i);
+                                    if (mm) { value = mm[1]; break; }
+                                }
+                            }
+                            if (value) {
+                                const jarUrl = `https://repo.papermc.io/repository/maven-public/io/papermc/paper/paper-api/${latest}/paper-api-${value}.jar`;
+                                log.info(`Downloading FALLBACK latest paper-api: ${jarUrl}`);
+                                await downloadToFile(jarUrl, cached);
+                                if ((await fsp.stat(cached)).size > 1024) out.push(cached);
+                            }
+                        } else { r2.body.dump?.(); }
+                    }
+                } else { res.body.dump?.(); }
+            } catch (e) {
+                log.warn('latest paper-api fetch failed:', e.message.slice(0, 200));
+            }
+        }
+    }
+
+    // ---- 3) Last-resort: any jars sitting next to server.jar ----
+    if (!out.length) {
+        try {
+            const sibling = (await fsp.readdir(server.dir))
+                .filter((f) => /\.jar$/i.test(f))
+                .map((f) => path.join(server.dir, f));
+            for (const j of sibling) out.push(j);
+        } catch { /* ignore */ }
+    }
+
+    return out;
+}
+
+/**
+ * Нормализует plugin.yml: гарантирует наличие обязательных полей
+ * name / main / version / api-version, выводит имя main класса из .java.
+ */
+async function normalizePluginYml(ymlPath, javaFile, fallbackName) {
+    let yml = '';
+    try { yml = await fsp.readFile(ymlPath, 'utf8'); } catch { yml = ''; }
+    const javaSrc = await fsp.readFile(javaFile, 'utf8').catch(() => '');
+    // Находим класс в .java
+    const classM = javaSrc.match(/public\s+class\s+([A-Za-z_][A-Za-z0-9_]*)/);
+    const className = classM ? classM[1] : fallbackName;
+    const pkgM = javaSrc.match(/^\s*package\s+([\w.]+)\s*;/m);
+    const fqcn = pkgM ? `${pkgM[1]}.${className}` : className;
+
+    const has = (k) => new RegExp(`^${k}\\s*:`, 'm').test(yml);
+    if (!has('name'))         yml = `name: ${className}\n${yml}`;
+    if (!has('main'))         yml = `${yml}\nmain: ${fqcn}\n`;
+    if (!has('version'))      yml = `${yml}\nversion: 1.0.0\n`;
+    if (!has('api-version'))  yml = `${yml}\napi-version: '1.13'\n`;
+    await fsp.writeFile(ymlPath, yml.trim() + '\n');
+    return { className, fqcn };
+}
+
+async function tryCompileJavaPlugin({ javaFile, pluginYmlPath, outDir, pluginName, server }) {
+    if (!ENV.JAVAC_BIN) {
+        // Последняя попытка автоустановки
+        try { await ensureJavacAvailable(); } catch {}
+        if (!ENV.JAVAC_BIN) return { ok: false, reason: 'javac не установлен (автоустановка не удалась)' };
+    }
+    const jarBin = findJarBin();
+    if (!jarBin) return { ok: false, reason: 'утилита jar не найдена (нужен JDK, а не JRE)' };
 
     const buildDir = path.join(outDir, '_build');
     await fsp.mkdir(buildDir, { recursive: true });
 
-    // Best-effort: try to find a bukkit/spigot/paper API jar on disk so the
-    // class compiles. Most Paper jars contain the API.
-    let classpath = '';
-    try {
-        const serverJars = (await fsp.readdir(path.dirname(outDir)))
-            .filter((f) => /\.jar$/i.test(f))
-            .map((f) => path.join(path.dirname(outDir), f));
-        if (serverJars.length) classpath = serverJars.join(path.delimiter);
-    } catch { /* ignore */ }
+    // Доводим plugin.yml до минимально валидного вида
+    try { await normalizePluginYml(pluginYmlPath, javaFile, pluginName); }
+    catch (e) { log.warn('normalizePluginYml warn:', e.message); }
 
-    const javacArgs = ['-d', buildDir];
+    // Resolve a real Bukkit/Paper API classpath (download/extract if needed).
+    let classpathEntries = [];
+    try {
+        classpathEntries = server ? await ensureBukkitApiJar(server) : [];
+    } catch (e) {
+        log.warn('ensureBukkitApiJar failed:', e.message);
+    }
+    if (!classpathEntries.length) {
+        log.warn('tryCompileJavaPlugin: classpath пуст — компиляция Bukkit плагинов невозможна без API jar.');
+    }
+    const classpath = classpathEntries.join(path.delimiter);
+
+    // Подбираем bytecode level в зависимости от MC версии:
+    //   ≤ 1.16  → Java 8 (target 1.8) — старые сервера не прочтут новее
+    //   1.17 .. 1.20.4 → Java 17
+    //   1.20.5+ → Java 21
+    let targetMajor = 17;
+    const mc = String(server?.mc_version || '').split('.').map(Number);
+    const mcMinor = mc[1] || 0, mcPatch = mc[2] || 0;
+    if (mcMinor <= 16) targetMajor = 8;
+    else if (mcMinor <= 19) targetMajor = 17;
+    else if (mcMinor === 20 && mcPatch < 5) targetMajor = 17;
+    else targetMajor = 21;
+
+    const javacArgs = ['-d', buildDir, '-proc:none', '-Xlint:none', '-nowarn', '-encoding', 'UTF-8'];
+    // Пробуем `--release N`; если хост JDK старье — падаём на -source/-target.
+    let useRelease = true;
+    try {
+        const probe = spawnSync(ENV.JAVAC_BIN, ['--release', String(targetMajor), '-version'],
+            { stdio: ['ignore', 'pipe', 'pipe'] });
+        if (probe.status !== 0) useRelease = false;
+    } catch { useRelease = false; }
+    if (useRelease) {
+        javacArgs.push('--release', String(targetMajor));
+    } else {
+        const sv = targetMajor === 8 ? '1.8' : String(targetMajor);
+        javacArgs.push('-source', sv, '-target', sv);
+    }
+
     if (classpath) javacArgs.push('-cp', classpath);
     javacArgs.push(javaFile);
 
     try {
         await runCmd(ENV.JAVAC_BIN, javacArgs);
     } catch (e) {
-        log.warn('javac failed:', e.message);
-        return null;
+        log.warn('javac failed:', e.message.slice(0, 600));
+        // Попытка retry без --release (на случай проблем с javac, который врёт про probe)
+        if (useRelease) {
+            try {
+                const args2 = javacArgs.filter((a, i, arr) => a !== '--release' && arr[i - 1] !== '--release');
+                args2.splice(args2.indexOf(javaFile), 0, '-source', '1.8', '-target', '1.8');
+                await runCmd(ENV.JAVAC_BIN, args2);
+            } catch (e2) {
+                return { ok: false, reason: 'javac: ' + e2.message.split('\n').slice(0, 5).join(' ').slice(0, 350) };
+            }
+        } else {
+            return { ok: false, reason: 'javac: ' + e.message.split('\n').slice(0, 5).join(' ').slice(0, 350) };
+        }
     }
 
     // Copy plugin.yml into build dir root
@@ -1635,7 +2669,7 @@ async function tryCompileJavaPlugin({ javaFile, pluginYmlPath, outDir, pluginNam
         await fsp.copyFile(pluginYmlPath, path.join(buildDir, 'plugin.yml'));
     } catch (e) {
         log.warn('copy plugin.yml failed:', e.message);
-        return null;
+        return { ok: false, reason: 'не удалось скопировать plugin.yml: ' + e.message };
     }
 
     const jarPath = path.join(outDir, `${pluginName}.jar`);
@@ -1643,11 +2677,11 @@ async function tryCompileJavaPlugin({ javaFile, pluginYmlPath, outDir, pluginNam
         await runCmd(jarBin, ['cf', jarPath, '-C', buildDir, '.']);
     } catch (e) {
         log.warn('jar cf failed:', e.message);
-        return null;
+        return { ok: false, reason: 'jar cf: ' + e.message };
     }
     // Cleanup intermediate build dir
     await fsp.rm(buildDir, { recursive: true, force: true }).catch(() => {});
-    return jarPath;
+    return { ok: true, jarPath };
 }
 
 // =====================================================================
@@ -1752,12 +2786,12 @@ async function safeEdit(ctx, text, extra = {}) {
 function mainMenuKeyboard(ctx) {
     const adm = isAdmin(ctx.from.id);
     const rows = [
-        [Markup.button.callback('🆕 Новый сервер',           'srv:new')],
-        [Markup.button.callback('📂 Мои серверы',            'srv:list')],
-        [Markup.button.callback('📦 Загрузить файл / плагин', 'srv:upload')],
-        [Markup.button.callback('✨ AI: сгенерировать плагин / скрипт', 'srv:aigen')],
+        [btn('🆕 Новый сервер', 'srv:new')],
+        [btn('📂 Мои серверы', 'srv:list')],
+        [btn('📦 Загрузить файл / плагин', 'srv:upload')],
+        [btn('✨ AI: сгенерировать плагин / скрипт', 'srv:aigen')],
     ];
-    if (adm) rows.push([Markup.button.callback('⚙️ Админ-панель', 'adm:open')]);
+    if (adm) rows.push([btn('⚙️ Админ-панель', 'adm:open')]);
     return Markup.inlineKeyboard(rows);
 }
 
@@ -1824,11 +2858,11 @@ bot.action('srv:new', async (ctx) => {
     return safeEdit(ctx,
         '🧱 Выберите сборку сервера:',
         Markup.inlineKeyboard([
-            [Markup.button.callback('Paper (рекомендуется)', 'new:flavor:paper')],
-            [Markup.button.callback('Spigot', 'new:flavor:spigot')],
-            [Markup.button.callback('Bukkit', 'new:flavor:bukkit')],
-            [Markup.button.callback('Forge (моды)', 'new:flavor:forge')],
-            [Markup.button.callback('⬅️ В меню', 'menu:main')],
+            [btn('Paper (рекомендуется)', 'new:flavor:paper')],
+            [btn('Spigot', 'new:flavor:spigot')],
+            [btn('Bukkit', 'new:flavor:bukkit')],
+            [btn('Forge (моды)', 'new:flavor:forge')],
+            [btn('⬅️ В меню', 'menu:main')],
         ])
     );
 });
@@ -1844,12 +2878,12 @@ bot.action(/^new:flavor:(paper|spigot|bukkit|forge)$/, async (ctx) => {
     } catch (e) {
         return safeEdit(ctx,
             `❌ Не удалось получить версии: <code>${esc(e.message)}</code>`,
-            Markup.inlineKeyboard([[Markup.button.callback('⬅️ В меню', 'menu:main')]])
+            Markup.inlineKeyboard([[btn('⬅️ В меню', 'menu:main')]])
         );
     }
     if (!versions.length) {
         return safeEdit(ctx, '❌ Список версий пуст.',
-            Markup.inlineKeyboard([[Markup.button.callback('⬅️ В меню', 'menu:main')]]));
+            Markup.inlineKeyboard([[btn('⬅️ В меню', 'menu:main')]]));
     }
     ctx.session.wizard.versions = versions;
     return renderVersionPage(ctx, 0);
@@ -1859,20 +2893,20 @@ async function renderVersionPage(ctx, page) {
     const all = ctx.session.wizard?.versions || [];
     if (!all.length) {
         return safeEdit(ctx, 'Сессия истекла. Нажмите /start.',
-            Markup.inlineKeyboard([[Markup.button.callback('⬅️ В меню', 'menu:main')]]));
+            Markup.inlineKeyboard([[btn('⬅️ В меню', 'menu:main')]]));
     }
     const flavor = ctx.session.wizard.flavor;
     const perPage = 12;
     const totalPages = Math.max(1, Math.ceil(all.length / perPage));
     const safePage = Math.min(Math.max(0, page), totalPages - 1);
     const slice = all.slice(safePage * perPage, (safePage + 1) * perPage);
-    const buttons = slice.map((v) => [Markup.button.callback(v, `new:ver:${v}`)]);
+    const buttons = slice.map((v) => [btn(v, `new:ver:${v}`)]);
     const nav = [];
-    if (safePage > 0) nav.push(Markup.button.callback('⬅️', `new:page:${safePage - 1}`));
-    nav.push(Markup.button.callback(`${safePage + 1}/${totalPages}`, 'noop'));
-    if (safePage < totalPages - 1) nav.push(Markup.button.callback('➡️', `new:page:${safePage + 1}`));
+    if (safePage > 0) nav.push(btn('⬅️', `new:page:${safePage - 1}`));
+    nav.push(btn(`${safePage + 1}/${totalPages}`, 'noop'));
+    if (safePage < totalPages - 1) nav.push(btn('➡️', `new:page:${safePage + 1}`));
     buttons.push(nav);
-    buttons.push([Markup.button.callback('⬅️ Назад', 'srv:new')]);
+    buttons.push([btn('⬅️ Назад', 'srv:new')]);
 
     return safeEdit(ctx,
         `Выберите версию Minecraft для <b>${esc(flavor)}</b> ` +
@@ -1885,7 +2919,7 @@ bot.action(/^new:page:(\d+)$/, async (ctx) => {
     await ctx.answerCbQuery().catch(() => {});
     if (!ctx.session.wizard?.versions) {
         return safeEdit(ctx, 'Сессия истекла. Нажмите /start.',
-            Markup.inlineKeyboard([[Markup.button.callback('⬅️ В меню', 'menu:main')]]));
+            Markup.inlineKeyboard([[btn('⬅️ В меню', 'menu:main')]]));
     }
     return renderVersionPage(ctx, Number(ctx.match[1]));
 });
@@ -1896,7 +2930,7 @@ bot.action(/^new:ver:(.+)$/, async (ctx) => {
     await ctx.answerCbQuery().catch(() => {});
     if (!ctx.session.wizard?.flavor) {
         return safeEdit(ctx, 'Сессия истекла. Нажмите /start.',
-            Markup.inlineKeyboard([[Markup.button.callback('⬅️ В меню', 'menu:main')]]));
+            Markup.inlineKeyboard([[btn('⬅️ В меню', 'menu:main')]]));
     }
     const version = ctx.match[1];
     ctx.session.wizard.mcVersion = version;
@@ -1907,7 +2941,7 @@ bot.action(/^new:ver:(.+)$/, async (ctx) => {
         `(латиница, цифры, точка, тире, подчёркивание; 2–40 символов).\n\n` +
         `Это имя будет видно в боте; далее спрошу слоты и MOTD.\n` +
         `Для отмены — /cancel`,
-        Markup.inlineKeyboard([[Markup.button.callback('⬅️ Назад', `new:flavor:${ctx.session.wizard.flavor}`)]])
+        Markup.inlineKeyboard([[btn('⬅️ Назад', `new:flavor:${ctx.session.wizard.flavor}`)]])
     );
 });
 
@@ -2055,17 +3089,101 @@ bot.on('text', async (ctx, next) => {
                 // Run the Forge installer (--installServer) inside the new dir.
                 await ctx.telegram.editMessageText(
                     ctx.chat.id, dlMsg.message_id, undefined,
-                    `⛙️ Устанавливаю Forge (может занять 1-2 минуты)…`,
+                    `${pe('⚙️')} Устанавливаю Forge (может занять 1-2 минуты)…`,
                     { parse_mode: 'HTML' }
                 ).catch(() => {});
                 if (!ENV.JAVA_AVAILABLE) throw new Error('Java не найдена — установка Forge невозможна.');
-                await runCmd(ENV.JAVA_BIN, ['-jar', downloadPath, '--installServer'], { cwd: dir });
 
-                // Locate launch entrypoint after install.
+                // Выбираем ПРАВИЛЬНУЮ Java для установщика (для 1.12.2 — Java 8 обязательно!)
+                // installer.jar и server-jar должны запускаться одной и той же Java.
+                const fakeSrv = { flavor: 'forge', mc_version: w.mcVersion, mcVersion: w.mcVersion };
+                let installerJava = pickJavaForServer(fakeSrv);
+                if (!installerJava) {
+                    await ctx.telegram.editMessageText(
+                        ctx.chat.id, dlMsg.message_id, undefined,
+                        `${pe('⚙️')} Устанавливаю нужную Java для Forge через apt-get…`,
+                        { parse_mode: 'HTML' }
+                    ).catch(() => {});
+                    installerJava = await ensureJavaForServer(fakeSrv);
+                }
+                if (!installerJava) {
+                    const wanted = requiredJavaMajorsForMc(w.mcVersion, 'forge');
+                    throw new Error(
+                        `Для Forge ${w.mcVersion} нужна Java ${wanted[0]}, но она не найдена. ` +
+                        `Установите: sudo apt install openjdk-${wanted[0]}-jre-headless`
+                    );
+                }
+                log.info(`Forge installer for ${w.mcVersion} → Java ${installerJava.major}`);
+
+                // Pre-accept EULA so the installer / first launch doesn't trip on it.
+                await fsp.writeFile(path.join(dir, 'eula.txt'), 'eula=true\n').catch(() => {});
+
+                // The Forge installer can be chatty and slow. Pipe a timeout-aware run
+                // and surface stderr in the error message if it fails.
+                // Для старых Forge (≤1.12.2) инсталлер не всегда сам скачивает
+                // minecraft_server.<ver>.jar (сервер Mojang) — предварительно
+                // положим его в папку, чтобы инсталлер видел всё необходимое.
+                try {
+                    const mcVerParts = String(w.mcVersion).split('.').map(Number);
+                    const isLegacyForge = (mcVerParts[1] || 0) <= 12;
+                    if (isLegacyForge) {
+                        try {
+                            const vanillaUrl = await resolveVanillaServerJarUrl(w.mcVersion);
+                            if (vanillaUrl) {
+                                const vanillaPath = path.join(dir, `minecraft_server.${w.mcVersion}.jar`);
+                                if (!fs.existsSync(vanillaPath)) {
+                                    log.info(`Forge legacy: предварительно качаю vanilla server ${w.mcVersion}`);
+                                    await downloadToFile(vanillaUrl, vanillaPath);
+                                }
+                            }
+                        } catch (e) {
+                            log.warn('Legacy Forge: не удалось предварительно загрузить vanilla server.jar:', e.message.slice(0, 200));
+                        }
+                    }
+                    await runCmd(
+                        installerJava.bin,
+                        ['-Xmx1G', '-jar', downloadPath, '--installServer'],
+                        { cwd: dir }
+                    );
+                } catch (e) {
+                    throw new Error('Forge installer завершился с ошибкой (Java ' + installerJava.major + '): ' + e.message.slice(0, 400));
+                }
+
+                // Locate launch entrypoint after install. Preference order:
+                //   1) run.sh   — official launcher from the installer (1.17+),
+                //                  it knows about user_jvm_args.txt + the right @args file
+                //   2) unix_args.txt — fall back to invoking java with @argsFile directly
+                //   3) old forge-*-universal.jar / forge-*.jar (pre-1.17)
                 const entries = await fsp.readdir(dir);
-                // Modern (1.17+): unix_args.txt
+                const runSh = entries.find((f) => f === 'run.sh' || f === 'run.bat');
                 const argsTxt = await findFile(dir, /unix_args\.txt$/i, 6);
-                if (argsTxt) {
+
+                if (runSh && runSh === 'run.sh') {
+                    // Make sure it's executable inside Docker volumes (umask often kills +x).
+                    try { await fsp.chmod(path.join(dir, runSh), 0o755); } catch {}
+
+                    // Make sure a sane user_jvm_args.txt exists with our heap settings.
+                    const userArgsPath = path.join(dir, 'user_jvm_args.txt');
+                    const heapBlock =
+                        '# Auto-generated by mc-tg-bot — JVM heap & GC\n' +
+                        `-Xms${ENV.JVM_XMS}\n` +
+                        `-Xmx${ENV.JVM_XMX}\n` +
+                        '-XX:+UseG1GC\n';
+                    try {
+                        if (fs.existsSync(userArgsPath)) {
+                            // Keep existing comments/flags, but prepend our heap block once.
+                            const cur = await fsp.readFile(userArgsPath, 'utf8');
+                            if (!/-Xmx/.test(cur)) {
+                                await fsp.writeFile(userArgsPath, heapBlock + '\n' + cur);
+                            }
+                        } else {
+                            await fsp.writeFile(userArgsPath, heapBlock);
+                        }
+                    } catch {}
+
+                    startCmdRecipe = { mode: 'forge-runsh', script: runSh };
+                    jarPath = path.join(dir, runSh); // stored for reference
+                } else if (argsTxt) {
                     startCmdRecipe = { mode: 'forge-args', argsFile: path.relative(dir, argsTxt) };
                     jarPath = path.relative(dir, argsTxt); // stored for reference
                 } else {
@@ -2077,6 +3195,9 @@ bot.on('text', async (ctx, next) => {
                     jarPath = path.join(dir, candidates[0]);
                     startCmdRecipe = { mode: 'jar', jar: candidates[0] };
                 }
+
+                // Delete the installer jar — it's no longer needed and confuses some users.
+                await fsp.rm(downloadPath, { force: true }).catch(() => {});
             } else {
                 jarPath = downloadPath;
                 startCmdRecipe = { mode: 'jar', jar: path.basename(downloadPath) };
@@ -2127,9 +3248,9 @@ bot.on('text', async (ctx, next) => {
             {
                 parse_mode: 'HTML',
                 ...Markup.inlineKeyboard([
-                    [Markup.button.callback('▶️ Запустить', `srv:start:${srv.id}`)],
-                    [Markup.button.callback('📂 К списку серверов', 'srv:list')],
-                    [Markup.button.callback('⬅️ В меню', 'menu:main')],
+                    [btn('▶️ Запустить', `srv:start:${srv.id}`)],
+                    [btn('📂 К списку серверов', 'srv:list')],
+                    [btn('⬅️ В меню', 'menu:main')],
                 ]),
             }
         );
@@ -2173,12 +3294,9 @@ bot.action('srv:list', async (ctx) => {
     }
     const rows = owned.map((s) => {
         const live = RUNNING.has(s.id) ? '🟢 ' : '⚪ ';
-        return [Markup.button.callback(
-            `${live}#${s.id} ${s.name} (${s.flavor} ${s.mc_version})`,
-            `srv:open:${s.id}`
-        )];
+        return [btn(`${live}#${s.id} ${s.name} (${s.flavor} ${s.mc_version})`, `srv:open:${s.id}`)];
     });
-    rows.push([Markup.button.callback('⬅️ В меню', 'menu:main')]);
+    rows.push([btn('⬅️ В меню', 'menu:main')]);
     return safeEdit(ctx, '📂 Ваши серверы:', Markup.inlineKeyboard(rows));
 });
 
@@ -2187,11 +3305,11 @@ bot.action(/^srv:open:(\d+)$/, async (ctx) => {
     const s = ServersRepo.byId(Number(ctx.match[1]));
     if (!s) {
         return safeEdit(ctx, 'Сервер не найден.',
-            Markup.inlineKeyboard([[Markup.button.callback('⬅️ К списку', 'srv:list')]]));
+            Markup.inlineKeyboard([[btn('⬅️ К списку', 'srv:list')]]));
     }
     if (!isAdmin(ctx.from.id) && s.owner_id !== ctx.from.id) {
         return safeEdit(ctx, '🚫 Это не ваш сервер.',
-            Markup.inlineKeyboard([[Markup.button.callback('⬅️ К списку', 'srv:list')]]));
+            Markup.inlineKeyboard([[btn('⬅️ К списку', 'srv:list')]]));
     }
     const live = RUNNING.has(s.id);
     const port = readServerPort(s.dir, s.port || 25565);
@@ -2221,15 +3339,15 @@ bot.action(/^srv:open:(\d+)$/, async (ctx) => {
         `Статус: ${live ? '🟢 запущен' : '⚪ остановлен'}`,
         Markup.inlineKeyboard([
             live
-                ? [Markup.button.callback('🛑 Остановить',       `srv:stop:${s.id}`),
-                   Markup.button.callback('🖥 Консоль',           `srv:console:${s.id}`)]
-                : [Markup.button.callback('▶️ Запустить',         `srv:start:${s.id}`)],
-            [Markup.button.callback('📊 Статус / онлайн',      `srv:status:${s.id}`)],
-            [Markup.button.callback('📦 Загрузить файл',          `srv:upfor:${s.id}`)],
-            [Markup.button.callback('📁 Файловый менеджер',       `fm:browse:${s.id}:`)],
-            [Markup.button.callback('📜 Лог',                     `srv:log:${s.id}`)],
-            [Markup.button.callback('🗑 Удалить',                  `srv:delask:${s.id}`)],
-            [Markup.button.callback('⬅️ К списку',                 'srv:list')],
+                ? [btn('🛑 Остановить', `srv:stop:${s.id}`),
+                   btn('🖥 Консоль', `srv:console:${s.id}`)]
+                : [btn('▶️ Запустить', `srv:start:${s.id}`)],
+            [btn('📊 Статус / онлайн', `srv:status:${s.id}`)],
+            [btn('📦 Загрузить файл', `srv:upfor:${s.id}`)],
+            [btn('📁 Файловый менеджер', `fm:browse:${s.id}:`)],
+            [btn('📜 Лог', `srv:log:${s.id}`)],
+            [btn('🗑 Удалить', `srv:delask:${s.id}`)],
+            [btn('⬅️ К списку', 'srv:list')],
         ])
     );
 });
@@ -2309,9 +3427,9 @@ async function refreshConsoleMessage(ctx, server, state, sentCmd) {
             {
                 parse_mode: 'HTML',
                 ...Markup.inlineKeyboard([
-                    [Markup.button.callback('🔄 Обновить', `srv:console:${server.id}`),
-                     Markup.button.callback('❌ Выйти',     `srv:consoff:${server.id}`)],
-                    [Markup.button.callback('🛑 Остановить сервер', `srv:stop:${server.id}`)],
+                    [btn('🔄 Обновить', `srv:console:${server.id}`),
+                     btn('❌ Выйти', `srv:consoff:${server.id}`)],
+                    [btn('🛑 Остановить сервер', `srv:stop:${server.id}`)],
                 ]),
             }
         );
@@ -2335,8 +3453,8 @@ bot.action(/^srv:console:(\d+)$/, async (ctx) => {
         return safeEdit(ctx,
             '⚠️ Сервер не запущен. Сначала нажмите «▶️ Запустить».',
             Markup.inlineKeyboard([
-                [Markup.button.callback('▶️ Запустить', `srv:start:${id}`)],
-                [Markup.button.callback('⬅️ К серверу', `srv:open:${id}`)],
+                [btn('▶️ Запустить', `srv:start:${id}`)],
+                [btn('⬅️ К серверу', `srv:open:${id}`)],
             ])
         );
     }
@@ -2350,9 +3468,9 @@ bot.action(/^srv:console:(\d+)$/, async (ctx) => {
         {
             parse_mode: 'HTML',
             ...Markup.inlineKeyboard([
-                [Markup.button.callback('🔄 Обновить', `srv:console:${id}`),
-                 Markup.button.callback('❌ Выйти',     `srv:consoff:${id}`)],
-                [Markup.button.callback('🛑 Остановить сервер', `srv:stop:${id}`)],
+                [btn('🔄 Обновить', `srv:console:${id}`),
+                 btn('❌ Выйти', `srv:consoff:${id}`)],
+                [btn('🛑 Остановить сервер', `srv:stop:${id}`)],
             ]),
         }
     );
@@ -2368,7 +3486,7 @@ bot.action(/^srv:consoff:(\d+)$/, async (ctx) => {
     const s = ServersRepo.byId(id);
     return safeEdit(ctx,
         `Консоль закрыта.`,
-        Markup.inlineKeyboard([[Markup.button.callback('⬅️ К серверу', `srv:open:${s?.id || id}`)]])
+        Markup.inlineKeyboard([[btn('⬅️ К серверу', `srv:open:${s?.id || id}`)]])
     );
 });
 
@@ -2409,8 +3527,8 @@ bot.action(/^srv:status:(\d+)$/, async (ctx) => {
 
     return safeEdit(ctx, body,
         Markup.inlineKeyboard([
-            [Markup.button.callback('🔄 Обновить', `srv:status:${id}`)],
-            [Markup.button.callback('⬅️ К серверу', `srv:open:${id}`)],
+            [btn('🔄 Обновить', `srv:status:${id}`)],
+            [btn('⬅️ К серверу', `srv:open:${id}`)],
         ])
     );
 });
@@ -2441,13 +3559,13 @@ bot.action(/^fm:browse:(\d+):(.*)$/, async (ctx) => {
         absPath = resolveServerPath(s, relPath);
     } catch (e) {
         return safeEdit(ctx, `<tg-emoji emoji-id="5870657884844462243">❌</tg-emoji> ${esc(e.message)}`,
-            Markup.inlineKeyboard([[Markup.button.callback('⬅️ К серверу', `srv:open:${id}`)]]));
+            Markup.inlineKeyboard([[btn('⬅️ К серверу', `srv:open:${id}`)]]));
     }
 
     let stat;
     try { stat = await fsp.stat(absPath); } catch {
         return safeEdit(ctx, 'Путь не найден.',
-            Markup.inlineKeyboard([[Markup.button.callback('⬅️ К серверу', `srv:open:${id}`)]]));
+            Markup.inlineKeyboard([[btn('⬅️ К серверу', `srv:open:${id}`)]]));
     }
 
     // If it's a text file — show content
@@ -2464,8 +3582,8 @@ bot.action(/^fm:browse:(\d+):(.*)$/, async (ctx) => {
                     (truncated ? ' <i>[обрезан до 8 КБ]</i>' : '') +
                     `\n<pre>${esc(text)}</pre>`,
                     Markup.inlineKeyboard([
-                        [Markup.button.callback('🗑 Удалить файл', `fm:del:${id}:${encodeRelPath(relPath)}`)],
-                        [Markup.button.callback('⬅️ Назад', `fm:browse:${id}:${encodeRelPath(parentRel)}`)],
+                        [btn('🗑 Удалить файл', `fm:del:${id}:${encodeRelPath(relPath)}`)],
+                        [btn('⬅️ Назад', `fm:browse:${id}:${encodeRelPath(parentRel)}`)],
                     ])
                 );
                 return;
@@ -2479,8 +3597,8 @@ bot.action(/^fm:browse:(\d+):(.*)$/, async (ctx) => {
             `<tg-emoji emoji-id="5870528606328852614">📁</tg-emoji> <b>${esc(path.basename(absPath))}</b>\n` +
             `<i>Бинарный файл или не удалось прочитать.</i>`,
             Markup.inlineKeyboard([
-                [Markup.button.callback('🗑 Удалить файл', `fm:del:${id}:${encodeRelPath(relPath)}`)],
-                [Markup.button.callback('⬅️ Назад', `fm:browse:${id}:${encodeRelPath(parentRel)}`)],
+                [btn('🗑 Удалить файл', `fm:del:${id}:${encodeRelPath(relPath)}`)],
+                [btn('⬅️ Назад', `fm:browse:${id}:${encodeRelPath(parentRel)}`)],
             ])
         );
     }
@@ -2491,22 +3609,22 @@ bot.action(/^fm:browse:(\d+):(.*)$/, async (ctx) => {
         entries = await listDir(absPath);
     } catch (e) {
         return safeEdit(ctx, `Ошибка чтения директории: ${esc(e.message)}`,
-            Markup.inlineKeyboard([[Markup.button.callback('⬅️ К серверу', `srv:open:${id}`)]]));
+            Markup.inlineKeyboard([[btn('⬅️ К серверу', `srv:open:${id}`)]]));
     }
 
     const rows = entries.map((e) => {
         const childRel = relPath ? `${relPath}/${e.name}` : e.name;
         const icon = e.isDir ? '📂' : '📄';
-        return [Markup.button.callback(`${icon} ${e.name}`, `fm:browse:${id}:${encodeRelPath(childRel)}`)];
+        return [btn(`${icon} ${e.name}`, `fm:browse:${id}:${encodeRelPath(childRel)}`)];
     });
 
     // Back button
     const isRoot = !relPath || relPath === '';
     if (!isRoot) {
         const parentRel = relPath.includes('/') ? relPath.split('/').slice(0, -1).join('/') : '';
-        rows.push([Markup.button.callback('⬅️ Вверх', `fm:browse:${id}:${encodeRelPath(parentRel)}`)]);
+        rows.push([btn('⬅️ Вверх', `fm:browse:${id}:${encodeRelPath(parentRel)}`)]);
     }
-    rows.push([Markup.button.callback('⬅️ К серверу', `srv:open:${id}`)]);
+    rows.push([btn('⬅️ К серверу', `srv:open:${id}`)]);
 
     const title = relPath || '/';
     return safeEdit(ctx,
@@ -2535,8 +3653,8 @@ bot.action(/^fm:del:(\d+):(.+)$/, async (ctx) => {
     return safeEdit(ctx,
         `<tg-emoji emoji-id="5870875489362513438">🗑</tg-emoji> Удалить <code>${esc(relPath)}</code>?\n<i>Действие необратимо.</i>`,
         Markup.inlineKeyboard([
-            [Markup.button.callback('🗑 Да, удалить', `fm:delok:${id}:${encodeRelPath(relPath)}`)],
-            [Markup.button.callback('⬅️ Отмена',       `fm:browse:${id}:${encodeRelPath(parentRel)}`)],
+            [btn('🗑 Да, удалить', `fm:delok:${id}:${encodeRelPath(relPath)}`)],
+            [btn('⬅️ Отмена', `fm:browse:${id}:${encodeRelPath(parentRel)}`)],
         ])
     );
 });
@@ -2569,7 +3687,7 @@ bot.action(/^fm:delok:(\d+):(.+)$/, async (ctx) => {
     const parentRel = relPath.includes('/') ? relPath.split('/').slice(0, -1).join('/') : '';
     return safeEdit(ctx,
         `<tg-emoji emoji-id="5870633910337015697">✅</tg-emoji> <code>${esc(relPath)}</code> удалён.`,
-        Markup.inlineKeyboard([[Markup.button.callback('📁 Вернуться', `fm:browse:${id}:${encodeRelPath(parentRel)}`)]])
+        Markup.inlineKeyboard([[btn('📁 Вернуться', `fm:browse:${id}:${encodeRelPath(parentRel)}`)]])
     );
 });
 
@@ -2586,8 +3704,8 @@ bot.action(/^srv:delask:(\d+)$/, async (ctx) => {
         `❓ Удалить сервер «<b>${esc(s.name)}</b>» #${id}?\n` +
         `Это также удалит папку <code>${esc(s.dir)}</code>.`,
         Markup.inlineKeyboard([
-            [Markup.button.callback('🗑 Да, удалить',     `srv:del:${id}`)],
-            [Markup.button.callback('⬅️ Нет, назад',       `srv:open:${id}`)],
+            [btn('🗑 Да, удалить', `srv:del:${id}`)],
+            [btn('⬅️ Нет, назад', `srv:open:${id}`)],
         ])
     );
 });
@@ -2619,9 +3737,9 @@ bot.action('srv:upload', async (ctx) => {
         return safeEdit(ctx, 'Сначала создайте сервер.', mainMenuKeyboard(ctx));
     }
     const rows = owned.map((s) => [
-        Markup.button.callback(`#${s.id} ${s.name}`, `srv:upfor:${s.id}`),
+        btn(`#${s.id} ${s.name}`, `srv:upfor:${s.id}`),
     ]);
-    rows.push([Markup.button.callback('⬅️ В меню', 'menu:main')]);
+    rows.push([btn('⬅️ В меню', 'menu:main')]);
     return safeEdit(ctx, 'Выберите сервер для загрузки:', Markup.inlineKeyboard(rows));
 });
 
@@ -2639,7 +3757,7 @@ bot.action(/^srv:upfor:(\d+)$/, async (ctx) => {
         `на плагин/карту/архив для сервера «<b>${esc(s.name)}</b>».\n\n` +
         `Лимит: <b>${ENV.MAX_UPLOAD_MB} МБ</b> (для прямой загрузки в Telegram).\n` +
         `Для отмены — /cancel`,
-        Markup.inlineKeyboard([[Markup.button.callback('⬅️ К серверу', `srv:open:${id}`)]])
+        Markup.inlineKeyboard([[btn('⬅️ К серверу', `srv:open:${id}`)]])
     );
 });
 
@@ -2651,9 +3769,9 @@ bot.action('srv:aigen', async (ctx) => {
         return safeEdit(ctx, 'Сначала создайте сервер.', mainMenuKeyboard(ctx));
     }
     const rows = owned.map((s) => [
-        Markup.button.callback(`#${s.id} ${s.name}`, `srv:aigenfor:${s.id}`),
+        btn(`#${s.id} ${s.name}`, `srv:aigenfor:${s.id}`),
     ]);
-    rows.push([Markup.button.callback('⬅️ В меню', 'menu:main')]);
+    rows.push([btn('⬅️ В меню', 'menu:main')]);
     return safeEdit(ctx,
         '✨ Выберите сервер, для которого AI сгенерирует плагин или скрипт:',
         Markup.inlineKeyboard(rows)
@@ -2676,7 +3794,7 @@ bot.action(/^srv:aigenfor:(\d+)$/, async (ctx) => {
         `• <i>команда /heal которая лечит игрока</i>\n` +
         `• <i>автоматическое объявление времени каждые 5 минут</i>\n\n` +
         `Отправьте одним сообщением. Для отмены — /cancel`,
-        Markup.inlineKeyboard([[Markup.button.callback('⬅️ Отмена', `srv:open:${id}`)]])
+        Markup.inlineKeyboard([[btn('⬅️ Отмена', `srv:open:${id}`)]])
     );
 });
 
@@ -2742,26 +3860,44 @@ async function handleAiGenerate(ctx, serverId, promptText) {
         const javaFile = path.join(baseDir, result.files.find((f) => /\.java$/i.test(f.path))?.path || '');
         const ymlFile  = path.join(baseDir, result.files.find((f) => /plugin\.yml$/i.test(f.path))?.path || '');
         if (fs.existsSync(javaFile) && fs.existsSync(ymlFile)) {
+            // АВТОУСТАНОВКА JDK если javac нет (вместо того чтобы просто сообщить об ошибке)
+            if (!ENV.JAVAC_BIN) {
+                try {
+                    const wait2 = await ctx.reply(
+                        `${pe('⚙️')} javac не найден — устанавливаю JDK для компиляции…`,
+                        { parse_mode: 'HTML' }
+                    );
+                    await ensureJavacAvailable();
+                    try { await ctx.telegram.deleteMessage(ctx.chat.id, wait2.message_id); } catch {}
+                } catch (e) {
+                    log.warn('ensureJavacAvailable error:', e.message);
+                }
+            }
+
             if (ENV.JAVAC_BIN) {
+                // АВТОУСТАНОВКА в /plugins — создаём папку и кладём собранный jar туда
                 const pluginsDir = path.join(server.dir, 'plugins');
                 await fsp.mkdir(pluginsDir, { recursive: true });
-                const jar = await tryCompileJavaPlugin({
+                const compileRes = await tryCompileJavaPlugin({
                     javaFile,
                     pluginYmlPath: ymlFile,
                     outDir: pluginsDir,
                     pluginName: result.name,
+                    server,
                 });
-                if (jar) {
-                    extraNote = `\n✅ Плагин скомпилирован: <code>plugins/${esc(path.basename(jar))}</code>` +
+                if (compileRes && compileRes.ok) {
+                    extraNote = `\n${pe('✅')} Плагин скомпилирован и установлен: <code>plugins/${esc(path.basename(compileRes.jarPath))}</code>` +
                         `\nПерезапустите сервер для загрузки.`;
                 } else {
-                    extraNote = `\n⚠️ Авто-компиляция не удалась. Исходники сохранены в ` +
-                        `<code>${esc(descriptionPath)}</code> — соберите вручную (<code>javac</code> + <code>jar</code>).`;
+                    const why = compileRes && compileRes.reason ? compileRes.reason : 'неизвестная ошибка';
+                    extraNote = `\n${pe('⚠️')} Авто-компиляция не удалась: <code>${esc(why.slice(0, 250))}</code>\n` +
+                        `Исходники сохранены в <code>${esc(descriptionPath)}</code> — соберите вручную ` +
+                        `(<code>javac</code> + <code>jar</code>).`;
                 }
             } else {
-                extraNote = `\n⚠️ <b>javac</b> не найден. Исходники сохранены в ` +
-                    `<code>${esc(descriptionPath)}</code>.\nУстановите JDK (не JRE), например ` +
-                    `<code>openjdk-21-jdk</code>, и повторите генерацию.`;
+                extraNote = `\n${pe('⚠️')} <b>javac</b> не найден и автоустановка не удалась. Исходники в ` +
+                    `<code>${esc(descriptionPath)}</code>.\nУстановите JDK вручную: ` +
+                    `<code>sudo apt install -y openjdk-21-jdk-headless</code>.`;
             }
         }
     }
@@ -2777,8 +3913,8 @@ async function handleAiGenerate(ctx, serverId, promptText) {
         {
             parse_mode: 'HTML',
             ...Markup.inlineKeyboard([
-                [Markup.button.callback('▶️ Запустить сервер', `srv:start:${server.id}`)],
-                [Markup.button.callback('⬅️ К серверу', `srv:open:${server.id}`)],
+                [btn('▶️ Запустить сервер', `srv:start:${server.id}`)],
+                [btn('⬅️ К серверу', `srv:open:${server.id}`)],
             ]),
         }
     );
@@ -2888,7 +4024,7 @@ async function handleIncomingFile(ctx, opts) {
                 {
                     parse_mode: 'HTML',
                     ...Markup.inlineKeyboard([
-                        [Markup.button.callback('⬅️ К серверу', `srv:open:${server.id}`)],
+                        [btn('⬅️ К серверу', `srv:open:${server.id}`)],
                     ]),
                 }
             ).catch(() => {});
@@ -2907,7 +4043,7 @@ async function handleIncomingFile(ctx, opts) {
                 {
                     parse_mode: 'HTML',
                     ...Markup.inlineKeyboard([
-                        [Markup.button.callback('⬅️ К серверу', `srv:open:${server.id}`)],
+                        [btn('⬅️ К серверу', `srv:open:${server.id}`)],
                     ]),
                 }
             ).catch(() => {});
@@ -2926,13 +4062,156 @@ async function handleIncomingFile(ctx, opts) {
 
 function adminPanelKeyboard() {
     return Markup.inlineKeyboard([
-        [Markup.button.callback('➕ Выдать доступ',     'adm:grant')],
-        [Markup.button.callback('➖ Отозвать доступ',   'adm:revoke')],
-        [Markup.button.callback('👥 Список пользователей', 'adm:list')],
-        [Markup.button.callback(`🧠 Модель AI (${getSetting('ai_model')})`, 'adm:model')],
-        [Markup.button.callback('🌐 Публичный IP',      'adm:ip')],
-        [Markup.button.callback('⬅️ В меню',            'menu:main')],
+        [btn('➕ Выдать доступ', 'adm:grant')],
+        [btn('➖ Отозвать доступ', 'adm:revoke')],
+        [btn('👥 Список пользователей', 'adm:list')],
+        [btn(`🧠 Модель AI (${getSetting('ai_model')})`, 'adm:model')],
+        [btn('🌐 Публичный IP', 'adm:ip')],
+        [btn('📊 Нагрузка VPS', 'adm:vps')],
+        [btn('☕ Java / JDK', 'adm:java')],
+        [btn('⬅️ В меню', 'menu:main')],
     ]);
+}
+
+// ---------------------------------------------------------------
+// VPS / system stats helpers (for admin panel & ops debugging)
+// ---------------------------------------------------------------
+function _humanBytes(n) {
+    if (!Number.isFinite(n)) return '?';
+    const u = ['B', 'KB', 'MB', 'GB', 'TB'];
+    let i = 0; while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+    return `${n.toFixed(n >= 10 || i === 0 ? 0 : 1)} ${u[i]}`;
+}
+function _humanUptime(sec) {
+    sec = Math.max(0, Math.floor(sec));
+    const d = Math.floor(sec / 86400); sec %= 86400;
+    const h = Math.floor(sec / 3600);  sec %= 3600;
+    const m = Math.floor(sec / 60);    sec %= 60;
+    const parts = [];
+    if (d) parts.push(`${d}д`);
+    if (h) parts.push(`${h}ч`);
+    if (m) parts.push(`${m}м`);
+    if (!parts.length) parts.push(`${sec}с`);
+    return parts.join(' ');
+}
+function _cpuSnapshot() {
+    const cpus = os.cpus() || [];
+    let total = 0, idle = 0;
+    for (const c of cpus) {
+        for (const k of Object.keys(c.times)) total += c.times[k];
+        idle += c.times.idle;
+    }
+    return { total, idle, count: cpus.length, model: cpus[0]?.model || 'unknown' };
+}
+async function measureCpuUsage(ms = 700) {
+    const a = _cpuSnapshot();
+    await new Promise((r) => setTimeout(r, ms));
+    const b = _cpuSnapshot();
+    const dt = b.total - a.total;
+    const di = b.idle - a.idle;
+    if (dt <= 0) return { percent: 0, count: a.count, model: a.model };
+    const percent = Math.max(0, Math.min(100, 100 * (1 - di / dt)));
+    return { percent, count: a.count, model: a.model };
+}
+async function diskUsage(targetPath) {
+    try {
+        const { out } = await runCmd('df', ['-Pk', targetPath]);
+        const lines = out.trim().split('\n');
+        if (lines.length < 2) return null;
+        const cols = lines[lines.length - 1].split(/\s+/);
+        // FS  1K-blocks  Used  Available  Use%  Mountpoint
+        const total = parseInt(cols[1], 10) * 1024;
+        const used  = parseInt(cols[2], 10) * 1024;
+        const avail = parseInt(cols[3], 10) * 1024;
+        return { total, used, avail, mount: cols[5] || targetPath };
+    } catch { return null; }
+}
+async function processChildStats(pid) {
+    // Linux: /proc/<pid>/status и /proc/<pid>/stat — RSS и CPU%
+    try {
+        const status = await fsp.readFile(`/proc/${pid}/status`, 'utf8');
+        const m = status.match(/^VmRSS:\s+(\d+)\s*kB/m);
+        const rss = m ? parseInt(m[1], 10) * 1024 : 0;
+        return { rss };
+    } catch { return null; }
+}
+async function collectVpsStats() {
+    const cpu = await measureCpuUsage(700);
+    const load = os.loadavg();
+    const totalMem = os.totalmem();
+    const freeMem = os.freemem();
+    const usedMem = totalMem - freeMem;
+    const memPct = totalMem ? (usedMem / totalMem) * 100 : 0;
+    const procMem = process.memoryUsage();
+    const sysUptime = os.uptime();
+    const procUptime = process.uptime();
+    const disk = await diskUsage(ENV.SERVERS_ROOT);
+    const diskDb = await diskUsage(path.dirname(ENV.DB_PATH));
+    const node = process.version;
+    const platform = `${os.type()} ${os.release()} (${os.arch()})`;
+    const hostname = os.hostname();
+
+    // Running servers + their RAM
+    const running = [];
+    for (const [sid, st] of RUNNING) {
+        const srv = ServersRepo.byId(sid);
+        if (!srv) continue;
+        const ps = st.child && st.child.pid ? await processChildStats(st.child.pid) : null;
+        running.push({
+            id: sid,
+            name: srv.name,
+            flavor: srv.flavor,
+            mc: srv.mc_version,
+            uptime: Math.floor((Date.now() - (st.startedAt || Date.now())) / 1000),
+            rss: ps?.rss || 0,
+        });
+    }
+    return {
+        cpu, load, totalMem, freeMem, usedMem, memPct, procMem,
+        sysUptime, procUptime, disk, diskDb, node, platform, hostname, running,
+    };
+}
+function _bar(pct, width = 12) {
+    const filled = Math.max(0, Math.min(width, Math.round((pct / 100) * width)));
+    return '█'.repeat(filled) + '░'.repeat(width - filled);
+}
+function formatVpsStats(s) {
+    const lines = [];
+    lines.push(`<b>📊 Нагрузка VPS</b>`);
+    lines.push('');
+    lines.push(`<b>🖥️ Хост:</b> <code>${esc(s.hostname)}</code>`);
+    lines.push(`<b>⚙️ ОС:</b> <code>${esc(s.platform)}</code>`);
+    lines.push(`<b>🟢 Node.js:</b> <code>${esc(s.node)}</code>`);
+    lines.push(`<b>⏱ Uptime Системы:</b> ${esc(_humanUptime(s.sysUptime))}`);
+    lines.push(`<b>⏱ Uptime Бота:</b> ${esc(_humanUptime(s.procUptime))}`);
+    lines.push('');
+    lines.push(`<b>🔥 CPU:</b> <code>${s.cpu.percent.toFixed(1)}%</code> [${_bar(s.cpu.percent)}]`);
+    lines.push(`   ⤷ Ядер: <b>${s.cpu.count}</b>  •  <i>${esc((s.cpu.model || '').slice(0, 40))}</i>`);
+    lines.push(`   ⤷ LoadAvg: <code>${s.load.map((x) => x.toFixed(2)).join(' / ')}</code>`);
+    lines.push('');
+    lines.push(`<b>🧠 RAM:</b> <code>${_humanBytes(s.usedMem)}</code> / <code>${_humanBytes(s.totalMem)}</code> (${s.memPct.toFixed(1)}%) [${_bar(s.memPct)}]`);
+    lines.push(`   ⤷ Свободно: <code>${_humanBytes(s.freeMem)}</code>`);
+    lines.push(`   ⤷ Бот RSS: <code>${_humanBytes(s.procMem.rss)}</code> | Heap: <code>${_humanBytes(s.procMem.heapUsed)}</code>/<code>${_humanBytes(s.procMem.heapTotal)}</code>`);
+    if (s.disk) {
+        const dPct = (s.disk.used / s.disk.total) * 100;
+        lines.push('');
+        lines.push(`<b>💾 Диск (${esc(s.disk.mount)}):</b> <code>${_humanBytes(s.disk.used)}</code> / <code>${_humanBytes(s.disk.total)}</code> (${dPct.toFixed(1)}%) [${_bar(dPct)}]`);
+        lines.push(`   ⤷ Свободно: <code>${_humanBytes(s.disk.avail)}</code>`);
+    }
+    if (s.diskDb && (!s.disk || s.diskDb.mount !== s.disk.mount)) {
+        const dPct = (s.diskDb.used / s.diskDb.total) * 100;
+        lines.push(`<b>💾 Диск (${esc(s.diskDb.mount)} — DB):</b> ${_humanBytes(s.diskDb.used)} / ${_humanBytes(s.diskDb.total)} (${dPct.toFixed(1)}%)`);
+    }
+    lines.push('');
+    lines.push(`<b>🟩 Серверы Minecraft:</b> запущено ${s.running.length}`);
+    if (s.running.length) {
+        for (const r of s.running) {
+            lines.push(`   • <b>${esc(r.name)}</b> <i>(${esc(r.flavor)} ${esc(r.mc)})</i>: RAM <code>${_humanBytes(r.rss)}</code>, uptime ${_humanUptime(r.uptime)}`);
+        }
+    }
+    lines.push('');
+    lines.push(`<b>☕ Java:</b> ${(ENV.JAVA_INSTALLS || []).map((j) => `<code>${j.major}</code>`).join(', ') || '<i>нет</i>'}`);
+    return lines.join('\n');
 }
 
 async function openAdminPanel(ctx) {
@@ -2956,7 +4235,7 @@ bot.action('adm:grant', async (ctx) => {
     return safeEdit(ctx,
         '➕ Введите <b>@username</b> или числовой Telegram ID пользователя ' +
         'для <b>выдачи</b> доступа:',
-        Markup.inlineKeyboard([[Markup.button.callback('⬅️ Отмена', 'adm:open')]])
+        Markup.inlineKeyboard([[btn('⬅️ Отмена', 'adm:open')]])
     );
 });
 
@@ -2967,7 +4246,7 @@ bot.action('adm:revoke', async (ctx) => {
     return safeEdit(ctx,
         '➖ Введите <b>@username</b> или числовой Telegram ID пользователя ' +
         'для <b>отзыва</b> доступа:',
-        Markup.inlineKeyboard([[Markup.button.callback('⬅️ Отмена', 'adm:open')]])
+        Markup.inlineKeyboard([[btn('⬅️ Отмена', 'adm:open')]])
     );
 });
 
@@ -2986,7 +4265,7 @@ bot.action('adm:list', async (ctx) => {
     return safeEdit(ctx,
         `👥 <b>Пользователи с доступом:</b>\n${u}\n\n` +
         `<b>Ожидают подтверждения:</b>\n${p}`,
-        Markup.inlineKeyboard([[Markup.button.callback('⬅️ Назад', 'adm:open')]])
+        Markup.inlineKeyboard([[btn('⬅️ Назад', 'adm:open')]])
     );
 });
 
@@ -3004,7 +4283,7 @@ bot.action('adm:ip', async (ctx) => {
     return safeEdit(ctx,
         `<tg-emoji emoji-id="6042011682497106307">📍</tg-emoji> <b>Публичный IP:</b> <code>${ip ? esc(ip) : 'не определён'}</code>\n\n` +
         `<b>Адреса серверов:</b>\n${srvLines}`,
-        Markup.inlineKeyboard([[Markup.button.callback('⬅️ Назад', 'adm:open')]])
+        Markup.inlineKeyboard([[btn('⬅️ Назад', 'adm:open')]])
     );
 });
 
@@ -3024,14 +4303,14 @@ bot.action('adm:model', async (ctx) => {
         return safeEdit(ctx,
             `Текущая модель: <b>${esc(cur)}</b>\n\n` +
             `Список моделей получить не удалось. Можно оставить текущую.`,
-            Markup.inlineKeyboard([[Markup.button.callback('⬅️ Назад', 'adm:open')]])
+            Markup.inlineKeyboard([[btn('⬅️ Назад', 'adm:open')]])
         );
     }
     const slice = models.slice(0, 30);
     const buttons = slice.map((m) => [
-        Markup.button.callback(`${m === cur ? '✅ ' : ''}${m}`, `adm:setmodel:${m}`),
+        btn(`${m === cur ? '✅ ' : ''}${m}`, `adm:setmodel:${m}`),
     ]);
-    buttons.push([Markup.button.callback('⬅️ Назад', 'adm:open')]);
+    buttons.push([btn('⬅️ Назад', 'adm:open')]);
     return safeEdit(ctx,
         `Текущая модель: <b>${esc(cur)}</b>\nВыберите новую:`,
         Markup.inlineKeyboard(buttons)
@@ -3047,6 +4326,74 @@ bot.action(/^adm:setmodel:(.+)$/, async (ctx) => {
         `<tg-emoji emoji-id="5870633910337015697">✅</tg-emoji> Модель AI установлена: <b>${esc(m)}</b>`,
         adminPanelKeyboard()
     );
+});
+
+bot.action('adm:vps', async (ctx) => {
+    await ctx.answerCbQuery().catch(() => {});
+    if (!isAdmin(ctx.from.id)) return;
+    await safeEdit(ctx, '📊 Собираю статистику VPS…');
+    try {
+        const stats = await collectVpsStats();
+        return safeEdit(ctx, formatVpsStats(stats), Markup.inlineKeyboard([
+            [btn('🔄 Обновить', 'adm:vps')],
+            [btn('⬅️ Назад', 'adm:open')],
+        ]));
+    } catch (e) {
+        return safeEdit(ctx,
+            `⚠️ Ошибка сбора статистики: <code>${esc(e.message)}</code>`,
+            Markup.inlineKeyboard([[btn('⬅️ Назад', 'adm:open')]])
+        );
+    }
+});
+
+bot.action('adm:java', async (ctx) => {
+    await ctx.answerCbQuery().catch(() => {});
+    if (!isAdmin(ctx.from.id)) return;
+    const installs = ENV.JAVA_INSTALLS || [];
+    let txt = '<b>☕ Доступные Java-версии</b>\n\n';
+    if (installs.length) {
+        for (const j of installs) {
+            txt += `• <b>Java ${j.major}</b>: <code>${esc(j.bin)}</code>\n   <i>${esc(j.version)}</i>\n`;
+        }
+    } else {
+        txt += '<i>Ни одной версии Java не найдено!</i>\n';
+    }
+    txt += '\n<b>javac:</b> ' + (ENV.JAVAC_BIN ? `<code>${esc(ENV.JAVAC_BIN)}</code>` : '<i>нет</i>');
+    txt += '\n<b>Дефолтный java:</b> ' + (ENV.JAVA_BIN ? `<code>${esc(ENV.JAVA_BIN)}</code>` : '<i>нет</i>');
+    txt += '\n\n<i>Рекомендуемые: Java 8 (Forge 1.7-1.12), Java 17 (1.17-1.20.4), Java 21 (1.20.5+).</i>';
+    return safeEdit(ctx, txt, Markup.inlineKeyboard([
+        [btn('➕ Доставить Java 8',  'adm:javainstall:8')],
+        [btn('➕ Доставить Java 17', 'adm:javainstall:17')],
+        [btn('➕ Доставить Java 21', 'adm:javainstall:21')],
+        [btn('🔄 Обновить список', 'adm:java')],
+        [btn('⬅️ Назад', 'adm:open')],
+    ]));
+});
+
+bot.action(/^adm:javainstall:(\d+)$/, async (ctx) => {
+    await ctx.answerCbQuery().catch(() => {});
+    if (!isAdmin(ctx.from.id)) return;
+    const major = parseInt(ctx.match[1], 10);
+    await safeEdit(ctx, `☕ Устанавливаю Java ${major}… Это может занять 1-3 минуты.`);
+    try {
+        const inst = await autoInstallJava(major);
+        if (inst) {
+            return safeEdit(ctx,
+                `<tg-emoji emoji-id="5870633910337015697">✅</tg-emoji> Java ${major} установлена: <code>${esc(inst.bin)}</code>`,
+                Markup.inlineKeyboard([[btn('⬅️ К Java', 'adm:java')]])
+            );
+        } else {
+            return safeEdit(ctx,
+                `❌ Не удалось установить Java ${major}. Смотрите логи бота.`,
+                Markup.inlineKeyboard([[btn('⬅️ К Java', 'adm:java')]])
+            );
+        }
+    } catch (e) {
+        return safeEdit(ctx,
+            `❌ Ошибка: <code>${esc(e.message)}</code>`,
+            Markup.inlineKeyboard([[btn('⬅️ К Java', 'adm:java')]])
+        );
+    }
 });
 
 // =====================================================================
@@ -3092,17 +4439,32 @@ process.once('SIGTERM', () => shutdown('SIGTERM'));
 // 14. LAUNCH
 // =====================================================================
 
-bot.launch().then(() => {
+bot.launch().then(async () => {
     log.info('🤖 Bot started. Admin ID:', ENV.ADMIN_ID);
     log.info('   Default model:', getSetting('ai_model'));
     log.info('   Servers root:', ENV.SERVERS_ROOT);
     if (ENV.JAVA_AVAILABLE) {
-        log.info('   Java:', ENV.JAVA_BIN, '|', ENV.JAVA_VERSION_STR);
+        log.info('   Java (default):', ENV.JAVA_BIN, '|', ENV.JAVA_VERSION_STR);
+        const list = (ENV.JAVA_INSTALLS || [])
+            .map((j) => `Java ${j.major} @ ${j.bin}`).join('; ');
+        if (list) log.info('   Все Java-инсталляции:', list);
     } else {
         log.warn('   ⚠️  Java НЕ НАЙДЕНА! Серверы не смогут запускаться.');
-        log.warn('   Установите OpenJDK 17+ или укажите JAVA_BIN в .env');
+        log.warn('   Установите OpenJDK 8 (для Forge 1.12.2), 17 и 21 — или укажите JAVA_BIN в .env');
     }
     log.info('   javac:', ENV.JAVAC_BIN || '<not found>');
+    // ─── АВТОУСТАНОВКА ВСЕГО НУЖНОГО ПРИ СТАРТЕ (в фоне) ───
+    // 1) Базовые OS-утилиты (unzip / tar / curl / wget / gpg)
+    ensureSystemTools().catch((e) => log.warn('ensureSystemTools error:', e.message));
+    // 2) Все Java-версии (8 / 17 / 21) — чтобы Forge 1.12.2 работал
+    //    сразу, и Paper 1.17+ тоже.
+    ensureAllJavaVersions().catch((e) => log.warn('ensureAllJavaVersions error:', e.message));
+    // 3) javac (для AI-генерации плагинов)
+    if (!ENV.JAVAC_BIN) {
+        ensureJavacAvailable().then((jc) => {
+            if (jc) log.info('   javac установлен автоматически:', jc);
+        }).catch((e) => log.warn('Авто-установка javac не удалась:', e.message));
+    }
 }).catch((e) => {
     log.error('Failed to launch bot:', e);
     process.exit(1);
