@@ -1639,13 +1639,23 @@ async function startServer(server, ctx) {
                 // Announce success + IP:port + full status (player count via SLP)
                 (async () => {
                     const port = readServerPort(server.dir, server.port || 25565);
-                    const ip = await getPublicIp().catch(() => null);
+                    const all = await getAllIps().catch(() => null);
+                    const ip = all?.forced || all?.public ||
+                               all?.ipv4?.find((x) => x.scope === 'public')?.address ||
+                               all?.ipv4?.[0]?.address || null;
                     // Give the server a beat to bind the port before pinging.
                     await new Promise((r) => setTimeout(r, 1500));
                     const status = await queryMinecraftStatus('127.0.0.1', port).catch(() => null);
 
+                    // Best-effort: проверяем, доступен ли порт извне.
+                    const portOpen = ip ? await isPortOpenPublic(ip, port).catch(() => null) : null;
+                    let portLine = '';
+                    if (portOpen === true)  portLine = `\n🔓 Порт <code>${port}</code>: <b>открыт извне</b> ✅`;
+                    else if (portOpen === false) portLine = `\n🔒 Порт <code>${port}</code>: <b>закрыт извне</b> ❌ — откройте в файрволе хоста/панели VPS или добавьте <code>-p ${port}:${port}/tcp -p ${port}:${port}/udp</code> в docker run`;
+
                     const uptime = Math.round((Date.now() - state.startedAt) / 1000);
                     const connStr = ip ? `${ip}:${port}` : `??:${port}`;
+                    const altBlock = all ? formatAddressBlock(all, port) : '';
                     let playersLine = '';
                     let motdLine = '';
                     let verLine  = '';
@@ -1661,12 +1671,14 @@ async function startServer(server, ctx) {
                     ctx.telegram.sendMessage(
                         state.chatId,
                         `<tg-emoji emoji-id="5870633910337015697">✅</tg-emoji> Сервер «<b>${esc(server.name)}</b>» запущен!\n\n` +
-                        `📍 Адрес: <code>${esc(connStr)}</code>\n` +
+                        `📍 Рекомендуемый адрес: <code>${esc(connStr)}</code>\n` +
                         `⚙️ Сборка: ${esc(server.flavor)} ${esc(server.mc_version)}` +
                         verLine +
                         playersLine +
                         motdLine +
-                        `\n⏱ Время старта: <b>${uptime}с</b>`,
+                        portLine +
+                        `\n⏱ Время старта: <b>${uptime}с</b>` +
+                        (altBlock ? `\n\n<b>Все адреса хоста:</b>\n${altBlock}` : ''),
                         {
                             parse_mode: 'HTML',
                             ...Markup.inlineKeyboard([
@@ -1796,14 +1808,157 @@ function stopServer(serverId) {
 // Cache the public IP for 10 minutes — it almost never changes on a host
 // and the auto-info banner uses it on every server-status refresh.
 let _publicIpCache = { ip: null, at: 0 };
+let _allIpsCache   = { data: null, at: 0 };
+
+// ---------------------------------------------------------------
+// IP classification helpers
+// ---------------------------------------------------------------
+function _isPrivateIPv4(ip) {
+    if (!/^\d{1,3}(\.\d{1,3}){3}$/.test(ip)) return false;
+    const [a, b] = ip.split('.').map(Number);
+    if (a === 10) return true;                          // 10.0.0.0/8
+    if (a === 127) return true;                         // 127.0.0.0/8 (loopback)
+    if (a === 172 && b >= 16 && b <= 31) return true;   // 172.16.0.0/12
+    if (a === 192 && b === 168) return true;            // 192.168.0.0/16
+    if (a === 169 && b === 254) return true;            // 169.254.0.0/16 (link-local)
+    if (a === 100 && b >= 64 && b <= 127) return true;  // 100.64.0.0/10 (CGNAT)
+    return false;
+}
+
+function _classifyIPv4(ip) {
+    if (!/^\d{1,3}(\.\d{1,3}){3}$/.test(ip)) return 'invalid';
+    const [a, b] = ip.split('.').map(Number);
+    if (a === 127) return 'loopback';
+    if (a === 169 && b === 254) return 'link-local';
+    if (a === 10) return 'private (10/8)';
+    if (a === 172 && b >= 16 && b <= 31) return 'private (172.16/12)';
+    if (a === 192 && b === 168) return 'private (192.168/16)';
+    if (a === 100 && b >= 64 && b <= 127) return 'CGNAT (100.64/10)';
+    return 'public';
+}
 
 /**
- * Fetch the public IP of the host. Strategy (with fallbacks):
+ * Probe one HTTP "what is my IP" service. Returns the trimmed body as string
+ * on HTTP 200 + valid IPv4 format. Throws otherwise.
+ */
+async function _probeIpService(url) {
+    const { statusCode, body } = await request(url, {
+        headers: { 'User-Agent': ENV.PAPER_UA, Accept: 'text/plain' },
+        headersTimeout: 4500,
+        bodyTimeout: 4500,
+        maxRedirections: 3,
+    });
+    if (statusCode !== 200) { body.dump?.(); throw new Error('status ' + statusCode); }
+    const txt = (await body.text()).trim();
+    if (!/^\d{1,3}(\.\d{1,3}){3}$/.test(txt)) throw new Error('not an ipv4');
+    return txt;
+}
+
+/**
+ * Returns ALL known addresses for this host. Used by the admin panel and
+ * the server-info banner so the user can copy whichever one actually
+ * reaches their Minecraft client (LAN, public, IPv6, …).
+ *
+ * Shape:
+ *   {
+ *     public:   '203.0.113.5'  | null,           // resolved via 6 HTTP services + DNS race
+ *     publicV6: '2a01:…'       | null,           // best-effort IPv6
+ *     forced:   '1.2.3.4'      | null,           // ENV.PUBLIC_IP override, if set
+ *     hostname: 'mc-host'      | null,           // os.hostname()
+ *     ipv4:     [{ iface, address, scope }, …],  // every non-internal IPv4
+ *     ipv6:     [{ iface, address, scope }, …],  // every non-internal IPv6
+ *   }
+ *
+ * Result is cached for 10 minutes (HTTP probes only).
+ */
+async function getAllIps() {
+    if (_allIpsCache.data && Date.now() - _allIpsCache.at < 600_000) {
+        return _allIpsCache.data;
+    }
+
+    const out = {
+        public:   null,
+        publicV6: null,
+        forced:   null,
+        hostname: null,
+        ipv4:     [],
+        ipv6:     [],
+    };
+
+    // 0) Manual override — always wins for display purposes
+    if (ENV.PUBLIC_IP && /^\d{1,3}(\.\d{1,3}){3}$/.test(ENV.PUBLIC_IP)) {
+        out.forced = ENV.PUBLIC_IP;
+    }
+
+    // 1) os.hostname()
+    try { out.hostname = os.hostname() || null; } catch { /* ignore */ }
+
+    // 2) Local interfaces (every non-internal address, NOT just the first)
+    try {
+        const nets = os.networkInterfaces();
+        for (const [iface, list] of Object.entries(nets)) {
+            for (const n of list || []) {
+                if (n.internal) continue;
+                if (n.family === 'IPv4' || n.family === 4) {
+                    out.ipv4.push({ iface, address: n.address, scope: _classifyIPv4(n.address) });
+                } else if (n.family === 'IPv6' || n.family === 6) {
+                    // Skip link-local fe80:: addresses (need %iface, unusable for MC)
+                    if (/^fe80:/i.test(n.address)) continue;
+                    out.ipv6.push({ iface, address: n.address, scope: 'public' });
+                }
+            }
+        }
+    } catch { /* ignore */ }
+
+    // 3) Public IPv4 — parallel race against several services + DNS fallback
+    const httpV4 = [
+        'https://api.ipify.org',
+        'https://ipv4.icanhazip.com',
+        'https://checkip.amazonaws.com',
+        'https://api.seeip.org',
+        'https://ifconfig.me/ip',
+        'https://ipinfo.io/ip',
+        'https://api.my-ip.io/ip',
+    ];
+    try {
+        out.public = await Promise.any(httpV4.map((u) => _probeIpService(u)));
+    } catch { /* all http failed — try DNS */ }
+
+    if (!out.public) {
+        try {
+            const Resolver = require('dns').promises.Resolver;
+            const r = new Resolver();
+            r.setServers(['208.67.222.222', '208.67.220.220']);
+            const ips = await r.resolve4('myip.opendns.com');
+            if (ips[0] && /^\d{1,3}(\.\d{1,3}){3}$/.test(ips[0])) out.public = ips[0];
+        } catch { /* ignore */ }
+    }
+
+    // 4) Public IPv6 (best-effort, single service)
+    try {
+        const { statusCode, body } = await request('https://api6.ipify.org', {
+            headers: { 'User-Agent': ENV.PAPER_UA, Accept: 'text/plain' },
+            headersTimeout: 4000,
+            bodyTimeout: 4000,
+        });
+        if (statusCode === 200) {
+            const txt = (await body.text()).trim();
+            if (/^[0-9a-f:]+$/i.test(txt) && txt.includes(':')) out.publicV6 = txt;
+        } else { body.dump?.(); }
+    } catch { /* ignore */ }
+
+    _allIpsCache = { data: out, at: Date.now() };
+    return out;
+}
+
+/**
+ * Fetch the public IP of the host (single-value helper, kept for backwards
+ * compatibility with existing call-sites). Strategy:
  *   0) ENV.PUBLIC_IP — forced override for VPS behind NAT / Docker
  *   1) cached value, if fresh
- *   2) parallel race against several public lookup services
- *   3) DNS-based services (myip.opendns.com via resolver4)
- *   4) hostname → IP local fallback (last resort — may return a LAN IP)
+ *   2) getAllIps().public
+ *   3) first PUBLIC IPv4 from local interfaces (not 127.*, not RFC1918, not 169.254.*)
+ *   4) first non-internal IPv4 (LAN — last resort)
  */
 async function getPublicIp() {
     if (ENV.PUBLIC_IP && /^\d{1,3}(\.\d{1,3}){3}$/.test(ENV.PUBLIC_IP)) {
@@ -1813,61 +1968,93 @@ async function getPublicIp() {
         return _publicIpCache.ip;
     }
 
-    const httpServices = [
-        'https://api.ipify.org',
-        'https://ipv4.icanhazip.com',
-        'https://checkip.amazonaws.com',
-        'https://api.seeip.org',
-        'https://ifconfig.me/ip',
-        'https://ipinfo.io/ip',
-    ];
+    const all = await getAllIps().catch(() => null);
+    if (all?.public) {
+        _publicIpCache = { ip: all.public, at: Date.now() };
+        return all.public;
+    }
 
-    const probeHttp = (url) => (async () => {
-        const { statusCode, body } = await request(url, {
-            headers: { 'User-Agent': ENV.PAPER_UA, Accept: 'text/plain' },
-            headersTimeout: 4500,
-            bodyTimeout: 4500,
-            maxRedirections: 3,
-        });
-        if (statusCode !== 200) { body.dump?.(); throw new Error('status ' + statusCode); }
-        const txt = (await body.text()).trim();
-        if (!/^\d{1,3}(\.\d{1,3}){3}$/.test(txt)) throw new Error('not an ipv4');
-        return txt;
-    })();
+    // Try a real public IPv4 from local interfaces first
+    const pub = all?.ipv4?.find((x) => x.scope === 'public');
+    if (pub) {
+        _publicIpCache = { ip: pub.address, at: Date.now() };
+        return pub.address;
+    }
 
-    // Race — first successful response wins.
-    try {
-        const ip = await Promise.any(httpServices.map(probeHttp));
-        _publicIpCache = { ip, at: Date.now() };
-        return ip;
-    } catch { /* all failed, try DNS-based */ }
-
-    // DNS fallback: OpenDNS "myip.opendns.com" returns the caller's IP
-    try {
-        const Resolver = require('dns').promises.Resolver;
-        const r = new Resolver();
-        r.setServers(['208.67.222.222', '208.67.220.220']);
-        const ips = await r.resolve4('myip.opendns.com');
-        const ip = ips[0];
-        if (/^\d{1,3}(\.\d{1,3}){3}$/.test(ip)) {
-            _publicIpCache = { ip, at: Date.now() };
-            return ip;
-        }
-    } catch { /* ignore */ }
-
-    // Last resort: local hostname → IP (may be 127.0.0.1 or LAN)
-    try {
-        const nets = os.networkInterfaces();
-        for (const list of Object.values(nets)) {
-            for (const n of list || []) {
-                if (n.family === 'IPv4' && !n.internal && !n.address.startsWith('169.254.')) {
-                    return n.address;
-                }
-            }
-        }
-    } catch { /* ignore */ }
+    // Last resort: any non-internal IPv4 (LAN). We DO NOT cache this — it's
+    // very likely wrong for clients outside the LAN.
+    const lan = all?.ipv4?.[0];
+    if (lan) return lan.address;
 
     return null;
+}
+
+/**
+ * Render a multi-line block listing every address by which the server can be
+ * reached, plus a clear hint about which one to give to the Minecraft client.
+ * Used by /start banner, server-info card and the admin IP panel.
+ */
+function formatAddressBlock(all, port) {
+    const lines = [];
+    const portStr = port ? `:${port}` : '';
+
+    if (all.forced) {
+        lines.push(`🟢 <b>Публичный (PUBLIC_IP)</b>: <code>${esc(all.forced)}${portStr}</code> — используйте этот`);
+    }
+    if (all.public && all.public !== all.forced) {
+        lines.push(`🌐 <b>Публичный IPv4</b>: <code>${esc(all.public)}${portStr}</code>${all.forced ? '' : ' — используйте этот'}`);
+    }
+    if (all.publicV6) {
+        lines.push(`🛰 <b>Публичный IPv6</b>: <code>[${esc(all.publicV6)}]${portStr}</code>`);
+    }
+
+    const publicLan = (all.ipv4 || []).filter((x) => x.scope === 'public' && x.address !== all.public);
+    for (const x of publicLan) {
+        lines.push(`🌐 <b>IPv4 на интерфейсе ${esc(x.iface)}</b>: <code>${esc(x.address)}${portStr}</code>`);
+    }
+
+    const privateLan = (all.ipv4 || []).filter((x) => x.scope !== 'public' && x.scope !== 'loopback');
+    for (const x of privateLan) {
+        lines.push(`🏠 <b>Локальный (${esc(x.scope)}) ${esc(x.iface)}</b>: <code>${esc(x.address)}${portStr}</code>`);
+    }
+
+    if (all.hostname) {
+        lines.push(`🖥 <b>Hostname</b>: <code>${esc(all.hostname)}${portStr}</code>`);
+    }
+
+    if (!lines.length) lines.push('<i>Не удалось определить ни одного адреса.</i>');
+    return lines.join('\n');
+}
+
+/**
+ * Quickest possible "is this TCP port reachable from the outside Internet" probe.
+ * Asks a third-party port-check API. Returns:
+ *   true  — port is OPEN from the public Internet
+ *   false — port is CLOSED / filtered
+ *   null  — couldn't determine (service down, no IP, etc.)
+ */
+async function isPortOpenPublic(ip, port) {
+    if (!ip || !port) return null;
+    if (_isPrivateIPv4(ip)) return null; // can't check private IPs from public services
+    try {
+        const url = `https://ifconfig.co/port/${port}?ip=${ip}`;
+        const { statusCode, body } = await request(url, {
+            headers: { 'User-Agent': ENV.PAPER_UA, Accept: 'application/json' },
+            headersTimeout: 6000,
+            bodyTimeout: 6000,
+        });
+        if (statusCode !== 200) { body.dump?.(); return null; }
+        const txt = await body.text();
+        try {
+            const j = JSON.parse(txt);
+            if (typeof j.reachable === 'boolean') return j.reachable;
+        } catch { /* not json */ }
+        if (/"reachable"\s*:\s*true/i.test(txt))  return true;
+        if (/"reachable"\s*:\s*false/i.test(txt)) return false;
+        return null;
+    } catch {
+        return null;
+    }
 }
 
 // =====================================================================
@@ -3225,12 +3412,20 @@ bot.on('text', async (ctx, next) => {
 
         // Pre-populate server.properties with port / slots / motd + branding
         // (footer is appended to motd; user can change later via file manager).
+        //
+        // CRITICAL: явно пишем `server-ip=` (пусто → эквивалентно 0.0.0.0).
+        // Это заставляет MC-сервер слушать ВСЕ интерфейсы, включая публичный.
+        // Если сервер свяжется только с 127.0.0.1, клиенты извне видят "server not found".
+        const bindHost = process.env.BIND_HOST || ''; // пусто = 0.0.0.0
+        await writeServerProperty(dir, 'server-ip',    bindHost).catch(() => {});
         await writeServerProperty(dir, 'server-port',  port).catch(() => {});
         await writeServerProperty(dir, 'query.port',   port).catch(() => {});
         await writeServerProperty(dir, 'max-players',  w.slots).catch(() => {});
         await writeServerProperty(dir, 'motd',         `${w.motd} §8— ${ENV.BRAND_MOTD}`).catch(() => {});
         await writeServerProperty(dir, 'online-mode',  'true').catch(() => {});
         await writeServerProperty(dir, 'enable-status','true').catch(() => {});
+        await writeServerProperty(dir, 'enable-query', 'true').catch(() => {});
+        await writeServerProperty(dir, 'prevent-proxy-connections', 'false').catch(() => {});
 
         ctx.session.wizard = null;
         try { await ctx.telegram.deleteMessage(ctx.chat.id, dlMsg.message_id); } catch {}
@@ -3502,10 +3697,17 @@ bot.action(/^srv:status:(\d+)$/, async (ctx) => {
         return ctx.answerCbQuery('🚫 Это не ваш сервер.', { show_alert: true }).catch(() => {});
     const live = RUNNING.has(id);
     const port = readServerPort(s.dir, s.port || 25565);
-    const ip   = await getPublicIp().catch(() => null);
+    const all  = await getAllIps().catch(() => null);
+    const ip   = all?.forced || all?.public ||
+                 all?.ipv4?.find((x) => x.scope === 'public')?.address ||
+                 all?.ipv4?.[0]?.address || null;
+    const portOpen = ip ? await isPortOpenPublic(ip, port).catch(() => null) : null;
+    let portLine = '';
+    if (portOpen === true)  portLine = `\n🔓 Порт: <b>открыт извне</b> ✅`;
+    else if (portOpen === false) portLine = `\n🔒 Порт: <b>закрыт извне</b> ❌ (проверьте firewall/port-mapping)`;
 
     let body = `⛙️ <b>${esc(s.name)}</b> — ${esc(s.flavor)} ${esc(s.mc_version)}\n` +
-               `📍 <code>${esc(ip ? ip + ':' + port : '??:' + port)}</code>\n` +
+               `📍 <code>${esc(ip ? ip + ':' + port : '??:' + port)}</code>${portLine}\n` +
                `📐 Слоты: <b>${esc(s.slots || 20)}</b>\n` +
                `Статус: ${live ? '🟢 запущен' : '⚪ остановлен'}`;
 
@@ -3524,6 +3726,8 @@ bot.action(/^srv:status:(\d+)$/, async (ctx) => {
             body += `\n<i>Сервер запущен, но пинг ещё не отвечает (подождите ~10 сек).</i>`;
         }
     }
+
+    if (all) body += `\n\n<b>Альтернативные адреса:</b>\n${formatAddressBlock(all, port)}`;
 
     return safeEdit(ctx, body,
         Markup.inlineKeyboard([
@@ -4269,22 +4473,72 @@ bot.action('adm:list', async (ctx) => {
     );
 });
 
+async function renderAdminIpPanel(ctx) {
+    await safeEdit(ctx, '<tg-emoji emoji-id="6028435952299413210">ℹ</tg-emoji> Определяю все адреса хоста…');
+    const all = await getAllIps().catch(() => null);
+    const servers = ServersRepo.listAll();
+
+    const addrBlock = all ? formatAddressBlock(all, null) : '<i>Не удалось определить адреса.</i>';
+    const bestIp = all?.forced || all?.public ||
+                   all?.ipv4?.find((x) => x.scope === 'public')?.address ||
+                   all?.ipv4?.[0]?.address || null;
+
+    // Per-server reachability check — in parallel, but cap at 6 servers
+    // to avoid hammering the third-party port-check service.
+    const srvSubset = servers.slice(0, 6);
+    const srvChecks = await Promise.all(srvSubset.map(async (s) => {
+        const port = readServerPort(s.dir, s.port || 25565);
+        const open = bestIp ? await isPortOpenPublic(bestIp, port).catch(() => null) : null;
+        const live = RUNNING.has(s.id) ? '🟢' : '⚪';
+        let portStatus;
+        if (open === true)  portStatus = '✅ открыт извне';
+        else if (open === false) portStatus = '❌ закрыт / файрвол';
+        else portStatus = '❔ проверка не удалась';
+        return `${live} <b>${esc(s.name)}</b>: <code>${bestIp ? bestIp + ':' + port : '??:' + port}</code> — ${portStatus}`;
+    }));
+    const overflow = servers.length > srvSubset.length
+        ? `\n<i>…и ещё ${servers.length - srvSubset.length} серверов (проверка портов ограничена)</i>` : '';
+    const srvLines = srvChecks.join('\n') || '<i>Серверов нет</i>';
+
+    // Diagnostic hint based on what we found
+    const hints = [];
+    if (!all?.public && !all?.forced) {
+        hints.push('⚠️ <b>Публичный IP не определён.</b> Скорее всего хост без интернета или за строгим файрволом. Задайте вручную через ENV: <code>PUBLIC_IP=...</code>');
+    }
+    if (all?.public && _isPrivateIPv4(all.public)) {
+        hints.push('⚠️ Публичный IP попал в частный диапазон — вероятно, вы за NAT/CGNAT. Попросите хостинг выдать выделенный IPv4.');
+    }
+    if (srvChecks.some((l) => l.includes('закрыт'))) {
+        hints.push('ℹ️ Порт закрыт извне — откройте его в панели хостинга (Firewall / Port forwarding) или пробросьте в Docker: <code>-p &lt;port&gt;:&lt;port&gt;/tcp -p &lt;port&gt;:&lt;port&gt;/udp</code>');
+    }
+    if (!hints.length && (all?.public || all?.forced)) {
+        hints.push('✅ IP определён. Если игроки не могут подключиться — проверьте файрвол хоста и порт-маппинг Docker.');
+    }
+
+    return safeEdit(ctx,
+        `<tg-emoji emoji-id="6042011682497106307">📍</tg-emoji> <b>Адреса хоста:</b>\n${addrBlock}\n\n` +
+        `<b>Серверы (лучший IP + проверка порта):</b>\n${srvLines}${overflow}\n\n` +
+        hints.join('\n'),
+        Markup.inlineKeyboard([
+            [btn('🔄 Обновить (сброс кэша)', 'adm:ip:refresh')],
+            [btn('⬅️ Назад', 'adm:open')],
+        ])
+    );
+}
+
 bot.action('adm:ip', async (ctx) => {
     await ctx.answerCbQuery().catch(() => {});
     if (!isAdmin(ctx.from.id)) return;
-    await safeEdit(ctx, '<tg-emoji emoji-id="6028435952299413210">ℹ</tg-emoji> Определяю публичный IP…');
-    const ip = await getPublicIp().catch(() => null);
-    const servers = ServersRepo.listAll();
-    const srvLines = servers.map((s) => {
-        const port = readServerPort(s.dir, s.port || 25565);
-        return `• <b>${esc(s.name)}</b>: <code>${ip ? ip + ':' + port : '??:' + port}</code>`;
-    }).join('\n') || '<i>Серверов нет</i>';
+    return renderAdminIpPanel(ctx);
+});
 
-    return safeEdit(ctx,
-        `<tg-emoji emoji-id="6042011682497106307">📍</tg-emoji> <b>Публичный IP:</b> <code>${ip ? esc(ip) : 'не определён'}</code>\n\n` +
-        `<b>Адреса серверов:</b>\n${srvLines}`,
-        Markup.inlineKeyboard([[btn('⬅️ Назад', 'adm:open')]])
-    );
+// Force-refresh: drop both caches and re-run the panel
+bot.action('adm:ip:refresh', async (ctx) => {
+    await ctx.answerCbQuery('Кэш IP сброшен, обновляю…').catch(() => {});
+    if (!isAdmin(ctx.from.id)) return;
+    _publicIpCache = { ip: null, at: 0 };
+    _allIpsCache   = { data: null, at: 0 };
+    return renderAdminIpPanel(ctx);
 });
 
 bot.action('adm:model', async (ctx) => {

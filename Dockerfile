@@ -114,7 +114,13 @@ ENV NODE_ENV=production \
     MAX_UPLOAD_MB=50 \
     PORT_RANGE_MIN=25600 \
     PORT_RANGE_MAX=26600 \
-    ALLOW_SUDO_INSTALL=1
+    ALLOW_SUDO_INSTALL=1 \
+    BIND_HOST=
+
+# ── BIND_HOST ──
+# Пустая строка = будет записано `server-ip=` (эквивалентно 0.0.0.0) — MC-сервер
+# будет слушать все интерфейсы, включая публичный. НЕ меняйте без необходимости!
+# Если поставить 127.0.0.1 — клиенты извне НЕ смогут подключиться.
 
 # Required env vars (set in hosting panel, NOT in a file):
 #   BOT_TOKEN        — Telegram bot token
@@ -122,11 +128,41 @@ ENV NODE_ENV=production \
 #   ONLYSQ_API_KEY   — OnlySQ / OpenAI-compatible API key
 # Optional:
 #   ONLYSQ_BASE_URL, ONLYSQ_DEFAULT_MODEL, JVM_XMS, JVM_XMX, MAX_UPLOAD_MB,
-#   PORT_RANGE_MIN, PORT_RANGE_MAX, PUBLIC_IP (force-override)
+#   PORT_RANGE_MIN, PORT_RANGE_MAX,
+#   PUBLIC_IP        — force-override публичного IP (полезно за NAT/CGNAT)
+#   BIND_HOST        — интерфейс, на котором слушает MC-сервер (пустое = 0.0.0.0)
 
 VOLUME ["/data/servers", "/data/db"]
 
-# Expose the auto-allocated port range so the hosting panel can map it.
+# ──────────────────────────────────────────────────────────────────
+# PORT EXPOSURE
+# ──────────────────────────────────────────────────────────────────
+# EXPOSE — это ТОЛЬКО декларация. Docker всё равно не публикует порты автоматически.
+#
+# Чтобы игроки извне могли подключиться, ОБЯЗАТЕЛЬНО запускайте контейнер с публикацией
+# всего диапазона (либо в панели хостинга, либо вручную):
+#
+#   docker run -d --name mc-tg-bot \\
+#       -e BOT_TOKEN=... -e ADMIN_ID=... -e ONLYSQ_API_KEY=... \\
+#       -e PUBLIC_IP=<ваш IP или домен> \\
+#       -p 25600-26600:25600-26600/tcp \\
+#       -p 25600-26600:25600-26600/udp \\
+#       -v mc-data:/data \\
+#       <image>
+#
+# Или docker-compose:
+#   services:
+#     mcbot:
+#       network_mode: host           # простой вариант: порты видны напрямую
+#       ————— или —————
+#       ports:
+#         - "25600-26600:25600-26600/tcp"
+#         - "25600-26600:25600-26600/udp"
+#
+# ДОПОЛНИТЕЛЬНО на самом VPS: откройте диапазон в ufw/iptables/firewalld/панели:
+#   sudo ufw allow 25600:26600/tcp
+#   sudo ufw allow 25600:26600/udp
+#
 EXPOSE 25600-26600/tcp 25600-26600/udp
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \
