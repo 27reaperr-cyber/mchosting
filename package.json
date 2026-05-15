@@ -1,0 +1,22 @@
+{
+  "name": "mc-tg-bot",
+  "version": "1.0.0",
+  "description": "Telegram bot to manage Minecraft servers (Bukkit/Spigot/Paper) with OnlySQ AI integration",
+  "main": "bot.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node bot.js",
+    "dev": "node --watch bot.js"
+  },
+  "engines": {
+    "node": ">=18.17"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.3.0",
+    "dotenv": "^16.4.5",
+    "openai": "^4.67.3",
+    "telegraf": "^4.16.3",
+    "undici": "^6.20.0"
+  },
+  "license": "MIT"
+}
